@@ -63,6 +63,8 @@ pnpm --filter openwork-orchestrator dev -- \
   start --workspace /path/to/workspace --approval auto --allow-external
 ```
 
+When `OPENWORK_DEV_MODE=1` is set, orchestrator uses an isolated OpenCode dev state for config, auth, data, cache, and state. OpenWork's repo-level `pnpm dev` commands enable this automatically so local development does not reuse your personal OpenCode environment.
+
 The command prints pairing details (OpenWork server URL + token, OpenCode URL + auth) so remote OpenWork clients can connect.
 
 Use `--detach` to keep services running and exit the dashboard. The detach summary includes the
@@ -159,6 +161,46 @@ openwork approvals reply <id> --allow \
 openwork status \
   --openwork-url http://<host>:8787 \
   --opencode-url http://<host>:4096
+```
+
+## File sessions (JIT catalog + batch read/write)
+
+Create a short-lived workspace file session and sync files in batches:
+
+```bash
+# Create writable session
+openwork files session create \
+  --openwork-url http://<host>:8787 \
+  --token <client-token> \
+  --workspace-id <workspace-id> \
+  --write \
+  --json
+
+# Fetch catalog snapshot
+openwork files catalog <session-id> \
+  --openwork-url http://<host>:8787 \
+  --token <client-token> \
+  --limit 200 \
+  --json
+
+# Read one or more files
+openwork files read <session-id> \
+  --openwork-url http://<host>:8787 \
+  --token <client-token> \
+  --paths "README.md,notes/todo.md" \
+  --json
+
+# Write a file (inline content or --file)
+openwork files write <session-id> \
+  --openwork-url http://<host>:8787 \
+  --token <client-token> \
+  --path notes/todo.md \
+  --content "hello from openwork" \
+  --json
+
+# Watch change events and close session
+openwork files events <session-id> --openwork-url http://<host>:8787 --token <client-token> --since 0 --json
+openwork files session close <session-id> --openwork-url http://<host>:8787 --token <client-token> --json
 ```
 
 ## Smoke checks

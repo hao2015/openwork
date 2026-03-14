@@ -1,10 +1,11 @@
-import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import type { JSX } from "solid-js";
 import type { Part } from "@opencode-ai/sdk/v2/client";
-import { Check, ChevronDown, ChevronRight, Copy, Eye, File, FileEdit, FolderSearch, Pencil, Search, Sparkles, Terminal } from "lucide-solid";
+import { Check, ChevronDown, ChevronRight, CircleAlert, Copy, Eye, File, FileEdit, FolderSearch, Pencil, Search, Sparkles, Terminal } from "lucide-solid";
+import { createVirtualizer } from "@tanstack/solid-virtual";
 
-import type { MessageGroup, MessageWithParts, StepGroupMode } from "../../types";
-import { groupMessageParts, summarizeStep } from "../../utils";
+import { SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX, type MessageGroup, type MessageWithParts, type StepGroupMode } from "../../types";
+import { groupMessageParts, isUserVisiblePart, summarizeStep } from "../../utils";
 import PartView from "../part-view";
 import { perfNow, recordPerfLog } from "../../lib/perf-log";
 
@@ -20,6 +21,8 @@ export type MessageListProps = {
   activeSearchMessageId?: string | null;
   searchHighlightQuery?: string;
   workspaceRoot?: string;
+  scrollElement?: () => HTMLElement | undefined;
+  setScrollToMessageById?: (handler: ((messageId: string, behavior?: ScrollBehavior) => boolean) | null) => void;
   footer?: JSX.Element;
 };
 
@@ -49,6 +52,8 @@ type MessageBlock = {
 type MessageBlockItem = MessageBlock | StepClusterBlock;
 
 const EXPLORATION_TOOL_NAMES = new Set(["read", "glob", "grep", "search", "list", "list_files"]);
+const VIRTUALIZATION_THRESHOLD = 500;
+const VIRTUAL_OVERSCAN = 4;
 
 type ExplorationSummary = {
   files: number;
@@ -218,6 +223,99 @@ function getTaskStepInfo(part: Part): TaskStepInfo {
   return { isTask: true, agentType, sessionId };
 }
 
+function compactPathToken(value: string) {
+  const token = value
+    .trim()
+    .replace(/^[`'"([{]+|[`'"\])},.;:]+$/g, "");
+  const segments = token.split(/[\\/]/).filter(Boolean);
+  return segments.length > 0 ? segments[segments.length - 1] : token;
+}
+
+function compactText(value: string, max = 42) {
+  const singleLine = value.replace(/\s+/g, " ").trim();
+  if (!singleLine) return "";
+  return singleLine.length > max ? `${singleLine.slice(0, Math.max(0, max - 3))}...` : singleLine;
+}
+
+function isPathLike(value: string) {
+  return /^(?:[A-Za-z]:[\\/]|~[\\/]|\/[\w_\-~]|\.\.?[\\/])/.test(value) ||
+    /[\\/](?:\.opencode|Users|Library|workspaces)[\\/]/.test(value);
+}
+
+function toolHeadline(part: Part) {
+  if (part.type !== "tool") return "";
+
+  const record = part as any;
+  const state = record.state ?? {};
+  const input = state.input && typeof state.input === "object" ? (state.input as Record<string, unknown>) : {};
+  const tool = typeof record.tool === "string" ? record.tool.toLowerCase() : "";
+
+  const pick = (...keys: string[]) => {
+    for (const key of keys) {
+      const value = input[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return "";
+  };
+
+  const target = (...keys: string[]) => {
+    const raw = pick(...keys);
+    if (!raw) return "";
+    return isPathLike(raw) ? compactPathToken(raw) : raw;
+  };
+
+  if (tool === "bash") {
+    const description = pick("description");
+    if (description) return compactText(description);
+    const command = pick("command", "cmd");
+    return command ? compactText(`Run ${command}`, 48) : "Run command";
+  }
+
+  if (tool === "read") {
+    const file = target("filePath", "path", "file");
+    return file ? `Read ${file}` : "Read file";
+  }
+
+  if (tool === "edit") {
+    const file = target("filePath", "path", "file");
+    return file ? `Edit ${file}` : "Edit file";
+  }
+
+  if (tool === "write" || tool === "apply_patch") {
+    const file = target("filePath", "path", "file");
+    return file ? `Update ${file}` : "Update file";
+  }
+
+  if (tool === "grep" || tool === "glob" || tool === "search") {
+    const pattern = pick("pattern", "query");
+    return pattern ? `Search ${compactText(pattern, 36)}` : "Search code";
+  }
+
+  if (tool === "list" || tool === "list_files") {
+    const path = target("path");
+    return path ? `List ${path}` : "List files";
+  }
+
+  if (tool === "task") {
+    const description = pick("description");
+    if (description) return compactText(description);
+    const agent = pick("subagent_type");
+    return agent ? `Delegate ${agent}` : "Delegate task";
+  }
+
+  if (tool === "webfetch") {
+    const url = pick("url");
+    return url ? `Fetch ${compactText(url, 36)}` : "Fetch web page";
+  }
+
+  if (tool === "skill") {
+    const name = pick("name");
+    return name ? `Load skill ${name}` : "Load skill";
+  }
+
+  return "";
+}
+
 export default function MessageList(props: MessageListProps) {
   const [copyingId, setCopyingId] = createSignal<string | null>(null);
   let previousMessagePartCountById = new Map<string, number>();
@@ -299,6 +397,10 @@ export default function MessageList(props: MessageListProps) {
 
   const renderablePartsForMessage = (message: MessageWithParts) =>
     message.parts.filter((part) => {
+      if (!props.developerMode && !isUserVisiblePart(part)) {
+        return false;
+      }
+
       if (part.type === "reasoning") {
         return props.showThinking;
       }
@@ -412,7 +514,68 @@ export default function MessageList(props: MessageListProps) {
     return "";
   });
 
-  const shouldUseContentVisibility = createMemo(() => messageBlocks().length > 80);
+  const blockIndexByMessageId = createMemo(() => {
+    const next = new Map<string, number>();
+    messageBlocks().forEach((block, index) => {
+      if (block.kind === "steps-cluster") {
+        block.messageIds.forEach((id) => {
+          if (id) next.set(id, index);
+        });
+        return;
+      }
+      if (block.messageId) {
+        next.set(block.messageId, index);
+      }
+    });
+    return next;
+  });
+
+  const shouldVirtualize = createMemo(
+    () => Boolean(props.scrollElement?.()) && messageBlocks().length >= VIRTUALIZATION_THRESHOLD,
+  );
+
+  const virtualizer = createVirtualizer<HTMLElement, HTMLDivElement>({
+    get count() {
+      return messageBlocks().length;
+    },
+    getScrollElement: () => props.scrollElement?.() ?? null,
+    estimateSize: () => 220,
+    overscan: VIRTUAL_OVERSCAN,
+    getItemKey: (index) => {
+      const block = messageBlocks()[index];
+      if (!block) return `block-${index}`;
+      if (block.kind === "steps-cluster") {
+        return `steps-${block.messageIds.join(",")}`;
+      }
+      return `message-${block.messageId}`;
+    },
+  });
+
+  let cachedVirtualRows: ReturnType<typeof virtualizer.getVirtualItems> = [];
+  const virtualRows = createMemo(() => {
+    if (!shouldVirtualize()) {
+      cachedVirtualRows = [];
+      return [];
+    }
+    const rows = virtualizer.getVirtualItems();
+    if (rows.length > 0) {
+      cachedVirtualRows = rows;
+      return rows;
+    }
+    return cachedVirtualRows;
+  });
+
+  const virtualRowByIndex = createMemo(() => {
+    const map = new Map<number, ReturnType<typeof virtualizer.getVirtualItems>[number]>();
+    virtualRows().forEach((row) => {
+      map.set(row.index, row);
+    });
+    return map;
+  });
+
+  const virtualRowIndices = createMemo(() => virtualRows().map((row) => row.index));
+
+  const shouldUseContentVisibility = createMemo(() => !shouldVirtualize() && messageBlocks().length > 500);
   const blockPerfStyle = (index: number): JSX.CSSProperties | undefined => {
     if (!shouldUseContentVisibility()) return undefined;
     const total = messageBlocks().length;
@@ -423,113 +586,84 @@ export default function MessageList(props: MessageListProps) {
     };
   };
 
-  /** Compact single-line step row */
+  createEffect(() => {
+    const setScrollToMessageById = props.setScrollToMessageById;
+    if (!setScrollToMessageById) return;
+    const indexById = blockIndexByMessageId();
+    const useVirtualization = shouldVirtualize();
+
+    setScrollToMessageById((messageId, behavior = "smooth") => {
+      const index = indexById.get(messageId);
+      if (index === undefined) return false;
+
+      if (useVirtualization) {
+        virtualizer.scrollToIndex(index, { align: "center" });
+        return true;
+      }
+
+      const container = props.scrollElement?.();
+      if (!container) return false;
+      const escapedId = messageId.replace(/"/g, '\\"');
+      const target = container.querySelector(`[data-message-id="${escapedId}"]`) as HTMLElement | null;
+      if (!target) return false;
+      target.scrollIntoView({ behavior, block: "center" });
+      return true;
+    });
+  });
+
+  createEffect(() => {
+    if (!shouldVirtualize()) return;
+    queueMicrotask(() => {
+      virtualizer.measure();
+    });
+  });
+
+  onCleanup(() => {
+    props.setScrollToMessageById?.(null);
+  });
+
+  /** Quiet single-line timeline row */
   const StepRow = (rowProps: { part: Part; isUser: boolean; groupMode?: StepGroupMode }) => {
     const summary = createMemo(() => summarizeStep(rowProps.part));
-    const category = createMemo(() => summary().toolCategory ?? "tool");
-    const status = createMemo(() => summary().status);
-    const task = createMemo(() => getTaskStepInfo(rowProps.part));
+    const headline = createMemo(() => {
+      const fromTool = toolHeadline(rowProps.part);
+      if (fromTool) return fromTool;
+      const title = summary().title?.trim() ?? "";
+      const detail = summary().detail?.trim() ?? "";
+      if (title && detail && detail.toLowerCase() !== title.toLowerCase()) {
+        return `${title} - ${detail}`;
+      }
+      return detail || title || "Updates progress";
+    });
 
     if (rowProps.part.type === "reasoning") {
       return (
-        <div class="py-2">
-          <div
-            class={`rounded-2xl border border-gray-6/60 bg-gray-2/40 px-3 py-2.5 ${
-              rowProps.groupMode === "exploration" ? "opacity-85" : ""
-            }`}
-          >
-            <div class="text-[12px] font-medium text-gray-12">{summary().title}</div>
-            <Show when={summary().detail}>
-              {(detail) => (
-                <p class="mt-1 text-[12px] leading-relaxed text-gray-10 whitespace-pre-wrap break-words">
-                  {detail()}
-                </p>
-              )}
-            </Show>
+        <div class="flex items-start gap-3 text-[14px] text-gray-9">
+          <ChevronRight size={14} class="mt-[2px] shrink-0 text-gray-7" />
+          <div class="min-w-0 leading-relaxed">
+            <span class="mr-1">Execution timeline 1 step -</span>
+            <span>{headline()}</span>
           </div>
         </div>
       );
     }
 
     return (
-      <div class="flex items-center gap-2.5 py-1.5 min-h-[28px] group/step">
-        {/* Status dot */}
-        <div class={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDotClass(status())}`} />
-        {/* Tool icon */}
-        <div class={`shrink-0 ${
-          summary().isSkill 
-            ? "text-purple-10" 
-            : "text-gray-9"
-        }`}>
-          <ToolIcon category={category()} size={13} />
+      <div class="flex items-start gap-3 text-[14px] text-gray-9">
+        <ChevronRight size={14} class="mt-[2px] shrink-0 text-gray-7" />
+        <div class="min-w-0 leading-relaxed">
+          <span class="mr-1">Execution timeline 1 step -</span>
+          <span>{headline()}</span>
         </div>
-        {/* Title */}
-        <span class="text-[13px] text-gray-12 font-medium truncate shrink-0 max-w-[200px]">
-          {summary().title}
-        </span>
-        {/* Skill badge */}
-        <Show when={summary().isSkill}>
-          <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-purple-3 text-purple-11 shrink-0">
-            skill
-          </span>
-        </Show>
-        <Show when={task().isTask}>
-          <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-blue-3 text-blue-11 shrink-0">
-            subagent
-          </span>
-        </Show>
-        {/* Detail - truncated to single line */}
-        <Show when={summary().detail}>
-          <span class="text-[12px] text-gray-9 truncate min-w-0">
-            {summary().detail}
-          </span>
-        </Show>
-        <Show when={task().agentType && !summary().detail}>
-          {(agentType) => (
-            <span class="text-[12px] text-gray-9 truncate min-w-0">
-              {agentType()} agent
-            </span>
-          )}
-        </Show>
-        <Show when={Boolean(task().sessionId && props.openSessionById)}>
-          <button
-            type="button"
-            class="ml-auto text-[11px] text-blue-11 hover:text-blue-10 underline underline-offset-2"
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              const sessionId = task().sessionId;
-              if (!sessionId) return;
-              props.openSessionById?.(sessionId);
-            }}
-          >
-            open
-          </button>
-        </Show>
       </div>
     );
   };
 
-  /** Compact steps list */
+  /** Quiet steps list */
   const StepsList = (listProps: { parts: Part[]; isUser: boolean; groupMode: StepGroupMode }) => (
-    <div class="divide-y divide-gray-6/40">
+    <div class="flex flex-col gap-4">
       <For each={listProps.parts}>
-        {(part) => (
-          <div>
-            <StepRow part={part} isUser={listProps.isUser} groupMode={listProps.groupMode} />
-            <Show when={props.developerMode && part.type !== "reasoning" && (part.type !== "tool" || props.showThinking)}>
-              <div class="pl-6 pb-2 text-xs text-gray-10">
-                <PartView
-                  part={part}
-                  developerMode={props.developerMode}
-                  showThinking={props.showThinking}
-                  workspaceRoot={props.workspaceRoot}
-                  tone={listProps.isUser ? "dark" : "light"}
-                />
-              </div>
-            </Show>
-          </div>
-        )}
+        {(part) => <StepRow part={part} isUser={listProps.isUser} groupMode={listProps.groupMode} />}
       </For>
     </div>
   );
@@ -542,272 +676,20 @@ export default function MessageList(props: MessageListProps) {
     isUser: boolean;
     isInline?: boolean;
   }) => {
-    const relatedIds = () =>
-      containerProps.relatedIds ?? containerProps.stepGroups.map((group) => group.id).filter((id) => id !== containerProps.id);
-    const expanded = () => isStepsExpanded(containerProps.id, relatedIds());
-    const latestStep = () => latestStepPart(containerProps.stepGroups);
-    const allStepParts = () => containerProps.stepGroups.flatMap((group) => group.parts);
-    const toolCallCount = () =>
-      containerProps.stepGroups.reduce(
-        (sum, group) => sum + group.parts.reduce((count, part) => (part.type === "tool" ? count + 1 : count), 0),
-        0,
-      );
-    const reasoningCount = () =>
-      containerProps.stepGroups.reduce(
-        (sum, group) => sum + group.parts.reduce((count, part) => (part.type === "reasoning" ? count + 1 : count), 0),
-        0,
-      );
-    const explorationGroups = () => containerProps.stepGroups.filter((group) => group.mode === "exploration");
-    const explorationOnly = () =>
-      explorationGroups().length > 0 && explorationGroups().length === containerProps.stepGroups.length;
-    const explorationSummary = () => summarizeExploration(explorationGroups().flatMap((group) => group.parts));
-    const explorationState = () => explorationStatus(explorationGroups().flatMap((group) => group.parts));
-
-    const executionSummary = () => {
-      const tools = toolCallCount();
-      const reasoning = reasoningCount();
-      if (tools > 0 && reasoning > 0) {
-        return `${tools} step${tools === 1 ? "" : "s"} with ${reasoning} thought update${reasoning === 1 ? "" : "s"}`;
-      }
-      if (tools > 0) {
-        return `${tools} step${tools === 1 ? "" : "s"}`;
-      }
-      if (reasoning > 0) {
-        return `${reasoning} thought update${reasoning === 1 ? "" : "s"}`;
-      }
-      return "updates";
-    };
-
-    const compactPathToken = (value: string) => {
-      const token = value
-        .trim()
-        .replace(/^[`'"([{]+|[`'"\])},.;:]+$/g, "");
-      const segments = token.split(/[\\/]/).filter(Boolean);
-      return segments.length > 0 ? segments[segments.length - 1] : token;
-    };
-
-    const compactText = (value: string, max = 42) => {
-      const singleLine = value.replace(/\s+/g, " ").trim();
-      if (!singleLine) return "";
-      return singleLine.length > max ? `${singleLine.slice(0, Math.max(0, max - 3))}...` : singleLine;
-    };
-
-    const isPathLike = (value: string) =>
-      /^(?:[A-Za-z]:[\\/]|~[\\/]|\/[\w_\-~]|\.\.?[\\/])/.test(value) ||
-      /[\\/](?:\.opencode|Users|Library|workspaces)[\\/]/.test(value);
-
-    const toolHeadline = (part: Part) => {
-      if (part.type !== "tool") return "";
-
-      const record = part as any;
-      const state = record.state ?? {};
-      const input = state.input && typeof state.input === "object" ? (state.input as Record<string, unknown>) : {};
-      const tool = typeof record.tool === "string" ? record.tool.toLowerCase() : "";
-
-      const pick = (...keys: string[]) => {
-        for (const key of keys) {
-          const value = input[key];
-          if (typeof value === "string" && value.trim()) return value.trim();
-        }
-        return "";
-      };
-
-      const target = (...keys: string[]) => {
-        const raw = pick(...keys);
-        if (!raw) return "";
-        return isPathLike(raw) ? compactPathToken(raw) : raw;
-      };
-
-      if (tool === "bash") {
-        const description = pick("description");
-        if (description) return compactText(description);
-        const command = pick("command", "cmd");
-        return command ? compactText(`Run ${command}`, 48) : "Run command";
-      }
-
-      if (tool === "read") {
-        const file = target("filePath", "path", "file");
-        return file ? `Read ${file}` : "Read file";
-      }
-
-      if (tool === "edit") {
-        const file = target("filePath", "path", "file");
-        return file ? `Edit ${file}` : "Edit file";
-      }
-
-      if (tool === "write" || tool === "apply_patch") {
-        const file = target("filePath", "path", "file");
-        return file ? `Update ${file}` : "Update file";
-      }
-
-      if (tool === "grep" || tool === "glob" || tool === "search") {
-        const pattern = pick("pattern", "query");
-        return pattern ? `Search ${compactText(pattern, 36)}` : "Search code";
-      }
-
-      if (tool === "list" || tool === "list_files") {
-        const path = target("path");
-        return path ? `List ${path}` : "List files";
-      }
-
-      if (tool === "task") {
-        const description = pick("description");
-        if (description) return compactText(description);
-        const agent = pick("subagent_type");
-        return agent ? `Delegate ${agent}` : "Delegate task";
-      }
-
-      if (tool === "webfetch") {
-        const url = pick("url");
-        return url ? `Fetch ${compactText(url, 36)}` : "Fetch web page";
-      }
-
-      if (tool === "skill") {
-        const name = pick("name");
-        return name ? `Load skill ${name}` : "Load skill";
-      }
-
-      return "";
-    };
-
-    const latestStepLabel = () => {
-      const step = latestStep();
-      if (!step) return "Last step";
-
-      const fromTool = toolHeadline(step);
-      if (fromTool) return compactText(fromTool);
-
-      if (step.type === "tool") {
-        const toolName = String((step as any).tool ?? "").trim();
-        if (toolName) {
-          const friendlyTool = toolName.replace(/[_-]+/g, " ");
-          return compactText(friendlyTool);
-        }
-      }
-
-      const summary = summarizeStep(step);
-      const title = compactText(summary.title);
-      const detail = compactText(summary.detail ?? "");
-      const generic = /^(application|tool|step|working|done|completed|success)$/i.test(title);
-
-      if (title && !generic) return title;
-      if (detail) return isPathLike(detail) ? compactPathToken(detail) : detail;
-      if (title) return title;
-      return "Last step";
-    };
-    const hasRunning = () =>
-      allStepParts().some((part) => {
-        if (part.type !== "tool") return false;
-        const state = (part as any).state ?? {};
-        return state.status === "running" || state.status === "pending";
-      });
-
-    const collapsedLabel = () => {
-      if (explorationOnly()) {
-        return explorationState() === "exploring" ? "Exploring" : "Explored";
-      }
-      return expanded() ? "Hide timeline" : "Execution timeline";
-    };
-
-    const collapsedSummary = () => {
-      if (explorationOnly()) {
-        return formatExplorationSummary(explorationSummary());
-      }
-      return executionSummary();
-    };
-
-    const collapsedDetail = () => {
-      if (explorationOnly()) return "";
-      if (expanded()) return executionSummary();
-      return `${executionSummary()} - ${latestStepLabel()}`;
-    };
-
-    const groupHeaderLabel = (group: StepTimelineGroup) => {
-      if (group.mode !== "exploration") return "";
-      return explorationStatus(group.parts) === "exploring" ? "Exploring" : "Explored";
-    };
-
-    const groupHeaderSummary = (group: StepTimelineGroup) => {
-      if (group.mode !== "exploration") return "";
-      return formatExplorationSummary(summarizeExploration(group.parts));
-    };
+    const useInnerTimelineScroll = () => !Boolean(props.isStreaming);
 
     return (
-      <div class={containerProps.isInline ? (containerProps.isUser ? "mt-2" : "mt-3 pt-3") : ""}>
-        {/* Toggle button - clean, compact */}
-        <button
-          class={`flex items-center gap-2 py-1.5 text-[13px] transition-colors ${
-            containerProps.isUser
-              ? "text-gray-10 hover:text-gray-11"
-              : "text-gray-10 hover:text-gray-12"
-          }`}
-          onClick={() => toggleSteps(containerProps.id, relatedIds())}
-        >
-          <ChevronRight
-            size={14}
-            class={`transition-transform duration-200 ${expanded() ? "rotate-90" : ""}`}
-          />
-          <span class="font-medium inline-flex items-center gap-1.5 text-xs sm:text-[13px] text-gray-11">
-            <Show when={hasRunning()}>
-              <span class="inline-flex h-1 w-1 rounded-full bg-blue-10/70 animate-pulse" />
-            </Show>
-            <span class="truncate max-w-[58ch]">{collapsedLabel()}</span>
-          </span>
-          <Show when={explorationOnly()}>
-            <span class="text-[11px] text-gray-9 truncate max-w-[46ch]">{collapsedSummary()}</span>
-          </Show>
-          <Show when={!explorationOnly() && !expanded()}>
-            <span class="text-[11px] text-gray-9 truncate max-w-[42ch]">{collapsedDetail()}</span>
-          </Show>
-          <Show when={!explorationOnly() && expanded()}>
-            <span class="text-[11px] text-gray-9 truncate max-w-[42ch]">{collapsedSummary()}</span>
-          </Show>
-        </button>
-
-        {/* Expanded content */}
-        <Show when={expanded()}>
-          <div
-            class={`mt-1 ml-1 pl-3 border-l-2 max-h-[480px] overflow-y-auto ${
-              containerProps.isUser
-                ? "border-gray-6"
-                : "border-gray-6/60"
-            }`}
-          >
-            <For each={containerProps.stepGroups}>
-              {(group, index) => (
-                <div
-                  class={
-                    index() === 0
-                      ? ""
-                      : "mt-2 pt-2 border-t border-gray-6/40"
-                  }
-                >
-                  <Show when={group.mode === "exploration"}>
-                    <div class="mb-1 flex items-center gap-2 text-[11px] text-gray-9">
-                      <span
-                        class={`font-medium ${
-                          groupHeaderLabel(group) === "Exploring" ? "text-blue-11" : "text-gray-10"
-                        }`}
-                      >
-                        {groupHeaderLabel(group)}
-                      </span>
-                      <span class="truncate">{groupHeaderSummary(group)}</span>
-                    </div>
-                  </Show>
-                  <StepsList parts={group.parts} isUser={containerProps.isUser} groupMode={group.mode} />
-                </div>
-              )}
-            </For>
-          </div>
-        </Show>
+      <div class={containerProps.isInline ? (containerProps.isUser ? "mt-3" : "mt-4") : ""}>
+        <div class={`ml-4 flex flex-col gap-4 ${useInnerTimelineScroll() ? "max-h-[420px] overflow-y-auto pr-1" : ""}`}>
+          <For each={containerProps.stepGroups}>
+            {(group) => <StepsList parts={group.parts} isUser={containerProps.isUser} groupMode={group.mode} />}
+          </For>
+        </div>
       </div>
     );
   };
 
-  return (
-    <div class="space-y-5 pb-24" style={{ contain: "layout paint style" }}>
-      <For each={messageBlocks()}>
-        {(block, blockIndex) => {
+  const renderBlock = (block: MessageBlockItem, blockIndex: number) => {
           const blockMessageIds = block.kind === "steps-cluster" ? block.messageIds : [block.messageId];
           const hasSearchMatch = blockMessageIds.some((id) => props.searchMatchMessageIds?.has(id));
           const hasActiveSearchMatch = blockMessageIds.some((id) => id === props.activeSearchMessageId);
@@ -823,13 +705,13 @@ export default function MessageList(props: MessageListProps) {
                 class={`flex group ${block.isUser ? "justify-end" : "justify-start"}`.trim()}
                 data-message-role={block.isUser ? "user" : "assistant"}
                 data-message-id={block.messageIds[0] ?? ""}
-                style={blockPerfStyle(blockIndex())}
+                style={blockPerfStyle(blockIndex)}
               >
                 <div
-                  class={`w-full relative ${
+                  class={`${
                     block.isUser
-                      ? "max-w-[80%] px-5 py-3 rounded-[24px] bg-gray-3 text-gray-12 text-[14px] leading-relaxed font-medium"
-                      : "max-w-[650px] text-[15px] leading-7 text-gray-12 group"
+                      ? "relative max-w-[85%] rounded-[24px] border border-dls-border bg-dls-sidebar px-6 py-4 text-[15px] leading-relaxed text-dls-text"
+                      : "w-full relative max-w-[760px] text-[15px] leading-[1.7] text-dls-text group"
                   } ${searchOutlineClass}`}
                 >
                   <StepsContainer
@@ -844,30 +726,61 @@ export default function MessageList(props: MessageListProps) {
           }
 
           const groupSpacing = block.isUser ? "mb-3" : "mb-4";
+          const isSyntheticSessionError =
+            !block.isUser && block.messageId.startsWith(SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX);
+
+          if (isSyntheticSessionError) {
+            const messageText = block.renderableParts
+              .map((part) => partToText(part))
+              .join(" ")
+              .replace(/\s*\n+\s*/g, " ")
+              .replace(/\s{2,}/g, " ")
+              .trim();
+
+            return (
+              <div
+                class="flex group justify-start"
+                data-message-role="assistant"
+                data-message-id={block.messageId}
+                style={blockPerfStyle(blockIndex)}
+              >
+                <div class={`w-full relative max-w-[650px] ${searchOutlineClass}`}>
+                  <div
+                    class="inline-flex max-w-full items-start gap-2 rounded-[18px] border border-red-7/20 bg-red-1/35 px-3 py-2 text-[13px] leading-5 text-red-12 shadow-sm"
+                    role="alert"
+                  >
+                    <CircleAlert size={14} class="mt-0.5 shrink-0" />
+                    <div class="min-w-0 break-words">{messageText}</div>
+                  </div>
+                </div>
+              </div>
+            );
+          }
+
           return (
             <div
               class={`flex group ${block.isUser ? "justify-end" : "justify-start"}`.trim()}
               data-message-role={block.isUser ? "user" : "assistant"}
               data-message-id={block.messageId}
-              style={blockPerfStyle(blockIndex())}
+              style={blockPerfStyle(blockIndex)}
             >
               <div
-                class={`w-full relative ${
+                class={`${
                   block.isUser
-                    ? "max-w-[80%] px-5 py-3 rounded-[24px] bg-gray-3 text-gray-12 text-[14px] leading-relaxed font-medium"
-                    : "max-w-[650px] text-[15px] leading-[1.65] text-gray-12 font-serif antialiased group"
+                    ? "relative max-w-[85%] rounded-[24px] border border-dls-border bg-dls-sidebar px-6 py-4 text-[15px] leading-relaxed text-dls-text"
+                    : "w-full relative max-w-[760px] text-[15px] leading-[1.72] text-dls-text antialiased group"
                 } ${searchOutlineClass}`}
               >
                 <Show when={attachmentsForMessage(block.message).length > 0}>
                   <div class={block.isUser ? "mb-3 flex flex-wrap gap-2" : "mb-4 flex flex-wrap gap-2"}>
                     <For each={attachmentsForMessage(block.message)}>
                       {(attachment) => (
-                        <div class="flex items-center gap-2 rounded-2xl border border-gray-6 bg-gray-1/70 px-3 py-2 text-xs text-gray-11">
+                        <div class="flex items-center gap-2 rounded-[18px] border border-dls-border bg-dls-surface px-3 py-2 text-xs text-gray-11 shadow-[var(--dls-card-shadow)]">
                           <Show
                             when={isImageAttachment(attachment.mime)}
                             fallback={<File size={14} class="text-gray-9" />}
                           >
-                            <div class="h-12 w-12 rounded-xl bg-gray-2 overflow-hidden border border-gray-6">
+                            <div class="h-12 w-12 overflow-hidden rounded-xl border border-dls-border bg-dls-sidebar">
                               <img
                                 src={attachment.url}
                                 alt={attachment.filename}
@@ -946,8 +859,56 @@ export default function MessageList(props: MessageListProps) {
               </div>
             </div>
           );
-        }}
-      </For>
+        };
+
+  return (
+    <div class="pb-24" style={{ contain: "layout paint style" }}>
+      <Show
+        when={shouldVirtualize()}
+        fallback={(
+          <div class="space-y-4">
+            <For each={messageBlocks()}>{(block, blockIndex) => renderBlock(block, blockIndex())}</For>
+          </div>
+        )}
+      >
+        <Show
+          when={virtualRows().length > 0}
+          fallback={(
+            <div class="space-y-4">
+              <For each={messageBlocks()}>{(block, blockIndex) => renderBlock(block, blockIndex())}</For>
+            </div>
+          )}
+        >
+          <div
+            class="relative"
+            style={{
+              height: `${virtualizer.getTotalSize()}px`,
+              width: "100%",
+            }}
+          >
+            <For each={virtualRowIndices()}>
+              {(rowIndex) => {
+                const virtualRow = virtualRowByIndex().get(rowIndex);
+                if (!virtualRow) return null;
+                const block = messageBlocks()[rowIndex];
+                if (!block) return null;
+                return (
+                  <div
+                    data-index={rowIndex}
+                    ref={(el) => virtualizer.measureElement(el)}
+                    class="absolute left-0 top-0 w-full pb-4"
+                    style={{
+                      transform: `translateY(${virtualRow.start}px)`,
+                    }}
+                  >
+                    {renderBlock(block, rowIndex)}
+                  </div>
+                );
+              }}
+            </For>
+          </div>
+        </Show>
+      </Show>
       <Show when={props.footer}>{props.footer}</Show>
     </div>
   );

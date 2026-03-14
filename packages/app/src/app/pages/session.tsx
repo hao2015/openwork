@@ -23,28 +23,31 @@ import type {
 import {
   obsidianIsAvailable,
   openInObsidian,
+  readObsidianMirrorFile,
+  writeObsidianMirrorFile,
   type EngineInfo,
   type OpenworkServerInfo,
   type WorkspaceInfo,
 } from "../lib/tauri";
+import { createWorkspaceShellLayout } from "../lib/workspace-shell-layout";
 
 import {
   Box,
+  ChevronLeft,
+  ChevronRight,
   Check,
   Circle,
-  Cpu,
-  HeartPulse,
   HardDrive,
   History,
   ListTodo,
   Loader2,
+  Menu,
   MessageCircle,
   Maximize2,
   Minimize2,
   MoreHorizontal,
   Redo2,
   Search,
-  Settings,
   Shield,
   SlidersHorizontal,
   Undo2,
@@ -62,27 +65,29 @@ import {
   buildOpenworkConnectInviteUrl,
   buildOpenworkWorkspaceBaseUrl,
   createOpenworkServerClient,
+  OpenworkServerError,
   parseOpenworkWorkspaceIdFromUrl,
 } from "../lib/openwork-server";
 import type {
+  OpenworkFileSession,
   OpenworkServerClient,
   OpenworkServerSettings,
   OpenworkServerStatus,
-  OpenworkSoulStatus,
   OpenworkWorkspaceExport,
 } from "../lib/openwork-server";
 import { DEFAULT_OPENWORK_PUBLISHER_BASE_URL, publishOpenworkBundleJson } from "../lib/publisher";
 import { join } from "@tauri-apps/api/path";
 import {
+  isUserVisiblePart,
   isTauriRuntime,
   isWindowsPlatform,
   normalizeDirectoryPath,
   parseTemplateFrontmatter,
 } from "../utils";
 import { finishPerf, perfNow, recordPerfLog } from "../lib/perf-log";
+import { normalizeLocalFilePath } from "../lib/local-file-path";
 
 import browserSetupTemplate from "../data/commands/browser-setup.md?raw";
-import soulSetupTemplate from "../data/commands/give-me-a-soul.md?raw";
 
 import MessageList from "../components/session/message-list";
 import Composer from "../components/session/composer";
@@ -99,6 +104,7 @@ export type SessionViewProps = {
   tab: DashboardTab;
   setTab: (tab: DashboardTab) => void;
   setSettingsTab: (tab: SettingsTab) => void;
+  toggleSettings: () => void;
   activeWorkspaceDisplay: WorkspaceDisplay;
   activeWorkspaceRoot: string;
   workspaces: WorkspaceInfo[];
@@ -110,7 +116,6 @@ export type SessionViewProps = {
   recoverWorkspace: (workspaceId: string) => Promise<boolean> | boolean;
   editWorkspaceConnection: (workspaceId: string) => void;
   forgetWorkspace: (workspaceId: string) => void;
-  soulStatusByWorkspaceId: Record<string, OpenworkSoulStatus | null>;
   openCreateWorkspace: () => void;
   openCreateRemoteWorkspace: () => void;
   importWorkspaceConfig: () => void;
@@ -176,6 +181,17 @@ export type SessionViewProps = {
   mcpStatus: string | null;
   skills: SkillCard[];
   skillsStatus: string | null;
+  showSkillReloadBanner: boolean;
+  reloadBannerTitle: string;
+  reloadBannerBody: string;
+  reloadBannerBlocked: boolean;
+  reloadBannerActiveCount: number;
+  canReloadWorkspace: boolean;
+  reloadWorkspaceEngine: () => Promise<void>;
+  forceStopActiveConversations: () => Promise<void>;
+  dismissReloadBanner: () => void;
+  reloadBusy: boolean;
+  reloadError: string | null;
   busy: boolean;
   prompt: string;
   setPrompt: (value: string) => void;
@@ -198,8 +214,13 @@ export type SessionViewProps = {
   sessionStatus: string;
   renameSession: (sessionId: string, title: string) => Promise<void>;
   startProviderAuth: (providerId?: string) => Promise<ProviderOAuthStartResult>;
-  completeProviderAuthOAuth: (providerId: string, methodIndex: number, code?: string) => Promise<string | void>;
+  completeProviderAuthOAuth: (
+    providerId: string,
+    methodIndex: number,
+    code?: string
+  ) => Promise<{ connected: boolean; pending?: boolean; message?: string }>;
   submitProviderApiKey: (providerId: string, apiKey: string) => Promise<string | void>;
+  refreshProviders: () => Promise<unknown>;
   openProviderAuthModal: () => Promise<void>;
   closeProviderAuthModal: () => void;
   providerAuthModalOpen: boolean;
@@ -215,6 +236,9 @@ export type SessionViewProps = {
   setSessionAgent: (sessionId: string, agent: string | null) => void;
   saveSession: (sessionId: string) => Promise<string>;
   sessionStatusById: Record<string, string>;
+  hasEarlierMessages: boolean;
+  loadingEarlierMessages: boolean;
+  loadEarlierMessages: (sessionId: string) => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
 };
 
@@ -245,22 +269,9 @@ type SkillsSetBundleV1 = {
   };
 };
 
-const BROWSER_SETUP_TEMPLATE = (() => {
+const BROWSER_AUTOMATION_QUICKSTART_PROMPT = (() => {
   const parsed = parseTemplateFrontmatter(browserSetupTemplate);
-  const name = parsed?.data?.name?.trim() || "browser-setup";
-  const description = parsed?.data?.description?.trim() || "Guide the user through browser automation setup";
-  const body = (parsed?.body ?? browserSetupTemplate).trim();
-  return { name, description, body };
-})();
-
-const SOUL_SETUP_TEMPLATE = (() => {
-  const parsed = parseTemplateFrontmatter(soulSetupTemplate);
-  const name = parsed?.data?.name?.trim() || "give-me-a-soul";
-  const description =
-    parsed?.data?.description?.trim() ||
-    "Enable optional soul mode with persistent memory and scheduled check-ins";
-  const body = (parsed?.body ?? soulSetupTemplate).trim();
-  return { name, description, body };
+  return (parsed?.body ?? browserSetupTemplate).trim();
 })();
 
 const INITIAL_MESSAGE_WINDOW = 140;
@@ -286,6 +297,8 @@ export default function SessionView(props: SessionViewProps) {
   let messagesEndEl: HTMLDivElement | undefined;
   let bottomVisibilityEl: HTMLDivElement | undefined;
   let chatContainerEl: HTMLDivElement | undefined;
+  let scrollMessageIntoViewById: ((messageId: string, behavior?: ScrollBehavior) => boolean) | null = null;
+  const [isChatContainerReady, setIsChatContainerReady] = createSignal(false);
   let agentPickerRef: HTMLDivElement | undefined;
   let sessionMenuRef: HTMLDivElement | undefined;
   let searchInputEl: HTMLInputElement | undefined;
@@ -324,14 +337,22 @@ export default function SessionView(props: SessionViewProps) {
   const [messageWindowStart, setMessageWindowStart] = createSignal(0);
   const [messageWindowSessionId, setMessageWindowSessionId] = createSignal<string | null>(null);
   const [messageWindowExpanded, setMessageWindowExpanded] = createSignal(false);
+  const [initialAnchorPending, setInitialAnchorPending] = createSignal(false);
 
   const [obsidianAvailable, setObsidianAvailable] = createSignal(false);
 
-  // When a session is selected (i.e. we are in SessionView), the right sidebar is
-  // navigation-only. Avoid showing any tab as "selected" to reduce confusion.
-  const showRightSidebarSelection = createMemo(() => !props.selectedSessionId);
+  // In Session view the right sidebar is navigation-only; never pre-highlight a
+  // dashboard tab here so first-run feels chat-first rather than Automations-first.
+  const showRightSidebarSelection = createMemo(() => false);
   let commandPaletteInputEl: HTMLInputElement | undefined;
   const commandPaletteOptionRefs: HTMLButtonElement[] = [];
+  const {
+    leftSidebarWidth,
+    rightSidebarExpanded,
+    rightSidebarWidth,
+    startLeftSidebarResize,
+    toggleRightSidebar,
+  } = createWorkspaceShellLayout({ expandedRightWidth: 280 });
 
   createEffect(() => {
     if (!isTauriRuntime()) {
@@ -445,6 +466,9 @@ export default function SessionView(props: SessionViewProps) {
     };
 
     for (const part of message.parts) {
+      if (!isUserVisiblePart(part)) {
+        continue;
+      }
       if (part.type === "text") {
         const text = (part as { text?: string }).text ?? "";
         push(text);
@@ -653,20 +677,37 @@ export default function SessionView(props: SessionViewProps) {
     return Math.min(hidden, MESSAGE_WINDOW_LOAD_CHUNK);
   });
 
-  const revealEarlierMessages = () => {
+  const hasServerEarlierMessages = createMemo(
+    () => !searchActive() && Boolean(props.selectedSessionId) && props.hasEarlierMessages,
+  );
+
+  const revealEarlierMessages = async () => {
     const hidden = hiddenMessageCount();
-    if (hidden <= 0) return;
-    const nextStart = Math.max(0, messageWindowStart() - MESSAGE_WINDOW_LOAD_CHUNK);
-    if (props.developerMode) {
-      recordPerfLog(true, "session.window", "reveal", {
-        sessionID: props.selectedSessionId,
-        hiddenBefore: hidden,
-        nextStart,
-      });
+    if (hidden > 0) {
+      const nextStart = Math.max(0, messageWindowStart() - MESSAGE_WINDOW_LOAD_CHUNK);
+      if (props.developerMode) {
+        recordPerfLog(true, "session.window", "reveal", {
+          sessionID: props.selectedSessionId,
+          hiddenBefore: hidden,
+          nextStart,
+        });
+      }
+      setMessageWindowStart(nextStart);
+      if (nextStart === 0) {
+        setMessageWindowExpanded(true);
+      }
+      return;
     }
-    setMessageWindowStart(nextStart);
-    if (nextStart === 0) {
-      setMessageWindowExpanded(true);
+
+    if (!hasServerEarlierMessages()) return;
+    if (!props.selectedSessionId) return;
+    setMessageWindowExpanded(true);
+    setMessageWindowStart(0);
+    await props.loadEarlierMessages(props.selectedSessionId);
+    if (props.developerMode) {
+      recordPerfLog(true, "session.window", "load-earlier", {
+        sessionID: props.selectedSessionId,
+      });
     }
   };
 
@@ -755,13 +796,525 @@ export default function SessionView(props: SessionViewProps) {
     return out;
   });
 
-  const resolveArtifactLocalPath = async (file: string) => {
-    const trimmed = file.trim();
-    if (!trimmed) return null;
+  const resolveLocalFileCandidates = async (file: string) => {
+    const trimmed = normalizeLocalFilePath(file).trim();
+    if (!trimmed) return [];
+    if (isAbsolutePath(trimmed)) return [trimmed];
+
     const root = props.activeWorkspaceRoot.trim();
-    if (!isAbsolutePath(trimmed) && !root) return null;
-    return !isAbsolutePath(trimmed) && root ? await join(root, trimmed) : trimmed;
+    if (!root) return [];
+
+    const normalized = trimmed.replace(/[\\/]+/g, "/").replace(/^\.\/+/, "").replace(/\/+$/, "");
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+
+    const pushCandidate = (value: string) => {
+      const key = value.trim().replace(/[\\/]+/g, "/").toLowerCase();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      candidates.push(value);
+    };
+
+    pushCandidate(await join(root, normalized));
+
+    if (normalized.startsWith(".opencode/openwork/outbox/")) {
+      return candidates;
+    }
+
+    if (normalized.startsWith("openwork/outbox/")) {
+      const suffix = normalized.slice("openwork/outbox/".length);
+      if (suffix) {
+        pushCandidate(await join(root, ".opencode", "openwork", "outbox", suffix));
+      }
+      return candidates;
+    }
+
+    if (normalized.startsWith("outbox/")) {
+      const suffix = normalized.slice("outbox/".length);
+      if (suffix) {
+        pushCandidate(await join(root, ".opencode", "openwork", "outbox", suffix));
+      }
+      return candidates;
+    }
+
+    if (!normalized.startsWith(".opencode/")) {
+      pushCandidate(await join(root, ".opencode", "openwork", "outbox", normalized));
+    }
+
+    return candidates;
   };
+
+  const runLocalFileAction = async (
+    file: string,
+    mode: "open" | "reveal" | "obsidian",
+    action: (candidate: string) => Promise<void>,
+  ) => {
+    const candidates = await resolveLocalFileCandidates(file);
+    if (!candidates.length) {
+      return { ok: false as const, reason: "missing-root" as const };
+    }
+
+    let lastError: unknown = null;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = candidates[index];
+      const startedAt = perfNow();
+      try {
+        recordPerfLog(props.developerMode, "session.file-open", "attempt", {
+          mode,
+          input: file,
+          target: candidate,
+          candidateIndex: index,
+          candidateCount: candidates.length,
+        });
+        await action(candidate);
+        finishPerf(props.developerMode, "session.file-open", "success", startedAt, {
+          mode,
+          input: file,
+          target: candidate,
+          candidateIndex: index,
+          candidateCount: candidates.length,
+        });
+        return { ok: true as const, path: candidate };
+      } catch (error) {
+        lastError = error;
+        console.warn("[session.file-open] candidate failed", {
+          mode,
+          input: file,
+          target: candidate,
+          candidateIndex: index,
+          candidateCount: candidates.length,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        finishPerf(props.developerMode, "session.file-open", "candidate-failed", startedAt, {
+          mode,
+          input: file,
+          target: candidate,
+          candidateIndex: index,
+          candidateCount: candidates.length,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    const suffix =
+      candidates.length > 1
+        ? ` (tried ${candidates.length} paths: workspace root and outbox fallbacks)`
+        : "";
+    return {
+      ok: false as const,
+      reason: `${lastError instanceof Error ? lastError.message : "File open failed"}${suffix}`,
+    };
+  };
+
+  type RemoteMirrorTrackedFile = {
+    path: string;
+    localPath: string;
+    remoteRevision: string;
+    localFingerprint: string;
+    syncingLocal: boolean;
+  };
+
+  type RemoteFileSyncSession = OpenworkFileSession & { cursor: number };
+
+  const remoteMirrorTrackedFiles = new Map<string, RemoteMirrorTrackedFile>();
+  const [remoteFileSyncSession, setRemoteFileSyncSession] = createSignal<RemoteFileSyncSession | null>(null);
+  const remoteMirrorWorkspaceKey = createMemo(
+    () => props.openworkServerWorkspaceId?.trim() || props.activeWorkspaceDisplay.id?.trim() || "remote-worker",
+  );
+  let remoteMirrorSyncTimer: number | undefined;
+  let remoteMirrorSyncInFlight = false;
+  let remoteMirrorLastErrorAt = 0;
+
+  const textFingerprint = (value: string) => {
+    let hash = 2166136261;
+    for (let idx = 0; idx < value.length; idx += 1) {
+      hash ^= value.charCodeAt(idx);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `${value.length}:${hash >>> 0}`;
+  };
+
+  const utf8ToBase64 = (value: string) => {
+    const bytes = new TextEncoder().encode(value);
+    let binary = "";
+    for (const byte of bytes) {
+      binary += String.fromCharCode(byte);
+    }
+    const fallbackBuffer = (globalThis as { Buffer?: { from: (input: string, encoding: string) => { toString: (encoding: string) => string } } }).Buffer;
+    if (typeof btoa !== "function") {
+      if (!fallbackBuffer) {
+        throw new Error("Base64 encoder is unavailable");
+      }
+      return fallbackBuffer.from(value, "utf8").toString("base64");
+    }
+    return btoa(binary);
+  };
+
+  const base64ToUtf8 = (value: string) => {
+    const fallbackBuffer = (globalThis as { Buffer?: { from: (input: string, encoding: string) => { toString: (encoding: string) => string } } }).Buffer;
+    if (typeof atob !== "function") {
+      if (!fallbackBuffer) {
+        throw new Error("Base64 decoder is unavailable");
+      }
+      return fallbackBuffer.from(value, "base64").toString("utf8");
+    }
+    const binary = atob(value);
+    const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  };
+
+  const stopRemoteMirrorSyncLoop = () => {
+    if (remoteMirrorSyncTimer !== undefined) {
+      window.clearInterval(remoteMirrorSyncTimer);
+      remoteMirrorSyncTimer = undefined;
+    }
+  };
+
+  const closeRemoteFileSyncSession = async (session: RemoteFileSyncSession | null) => {
+    const client = props.openworkServerClient;
+    if (!client || !session) return;
+    try {
+      await client.closeFileSession(session.id);
+    } catch {
+      // best effort
+    }
+  };
+
+  const resetRemoteFileSync = async () => {
+    stopRemoteMirrorSyncLoop();
+    remoteMirrorSyncInFlight = false;
+    remoteMirrorTrackedFiles.clear();
+    const existing = remoteFileSyncSession();
+    setRemoteFileSyncSession(null);
+    await closeRemoteFileSyncSession(existing);
+  };
+
+  const toWorkerRelativeArtifactPath = (file: string) => {
+    const normalized = file.trim().replace(/^file:\/\//i, "").replace(/[\\/]+/g, "/");
+    if (!normalized) return "";
+
+    const root = props.activeWorkspaceRoot.trim().replace(/[\\/]+/g, "/").replace(/\/+$/, "");
+    if (root) {
+      const rootKey = root.toLowerCase();
+      const fileKey = normalized.toLowerCase();
+      if (fileKey === rootKey) return "";
+      if (fileKey.startsWith(`${rootKey}/`)) {
+        return normalized.slice(root.length + 1);
+      }
+    }
+
+    let relative = normalized.replace(/^\.\/+/, "");
+
+    if (/^[ab]\/.+\.(md|mdx|markdown)$/i.test(relative)) {
+      relative = relative.slice(2);
+    }
+
+    if (/^workspace\//i.test(relative)) {
+      relative = relative.replace(/^workspace\//i, "");
+    }
+
+    if (/^\/+workspace\//i.test(relative)) {
+      relative = relative.replace(/^\/+workspace\//i, "");
+    }
+
+    if (!relative) return "";
+    if (relative.startsWith("/") || relative.startsWith("~") || /^[a-zA-Z]:\//.test(relative)) {
+      return "";
+    }
+    if (relative.split("/").some((part) => part === "." || part === "..")) {
+      return "";
+    }
+    return relative;
+  };
+
+  const toRemoteArtifactCandidates = (file: string) => {
+    const target = toWorkerRelativeArtifactPath(file);
+    if (!target) return [] as string[];
+    const outboxPath = `.opencode/openwork/outbox/${target}`.replace(/\/+/g, "/");
+    if (
+      target.startsWith(".opencode/openwork/outbox/") ||
+      target.startsWith("./.opencode/openwork/outbox/") ||
+      outboxPath === target
+    ) {
+      return [target];
+    }
+    return [target, outboxPath];
+  };
+
+  const ensureRemoteFileSyncSession = async (): Promise<RemoteFileSyncSession> => {
+    const client = props.openworkServerClient;
+    const workspaceId = props.openworkServerWorkspaceId?.trim() ?? "";
+    if (!client || !workspaceId) {
+      throw new Error("Connect to OpenWork server to sync remote files.");
+    }
+
+    const existing = remoteFileSyncSession();
+    if (existing && existing.workspaceId === workspaceId) {
+      if (Date.now() + 45_000 < existing.expiresAt) {
+        return existing;
+      }
+
+      try {
+        const renewed = await client.renewFileSession(existing.id, { ttlSeconds: 15 * 60 });
+        const next: RemoteFileSyncSession = {
+          ...renewed.session,
+          cursor: existing.cursor,
+        };
+        setRemoteFileSyncSession(next);
+        return next;
+      } catch (error) {
+        if (!(error instanceof OpenworkServerError) || error.code !== "file_session_not_found") {
+          throw error;
+        }
+      }
+    }
+
+    if (existing) {
+      await closeRemoteFileSyncSession(existing);
+      setRemoteFileSyncSession(null);
+    }
+
+    const created = await client.createFileSession(workspaceId, {
+      ttlSeconds: 15 * 60,
+      write: true,
+    });
+    const next: RemoteFileSyncSession = {
+      ...created.session,
+      cursor: 0,
+    };
+    setRemoteFileSyncSession(next);
+    return next;
+  };
+
+  const refreshTrackedRemoteMirrorFile = async (session: RemoteFileSyncSession, path: string) => {
+    const client = props.openworkServerClient;
+    if (!client) throw new Error("OpenWork server client unavailable");
+
+    const result = await client.readFileBatch(session.id, [path]);
+    const item = result.items[0];
+    if (!item?.ok) {
+      if (item?.code === "file_not_found") {
+        remoteMirrorTrackedFiles.delete(path);
+        return null;
+      }
+      throw new Error(item?.message ?? `Unable to read ${path}`);
+    }
+
+    const content = base64ToUtf8(item.contentBase64);
+    const localPath = await writeObsidianMirrorFile(remoteMirrorWorkspaceKey(), path, content);
+    const local = await readObsidianMirrorFile(remoteMirrorWorkspaceKey(), path);
+    const fingerprint = textFingerprint(local.content ?? content);
+
+    const previous = remoteMirrorTrackedFiles.get(path);
+    remoteMirrorTrackedFiles.set(path, {
+      path,
+      localPath,
+      remoteRevision: item.revision,
+      localFingerprint: fingerprint,
+      syncingLocal: previous?.syncingLocal ?? false,
+    });
+
+    return localPath;
+  };
+
+  const createConflictPath = (path: string) => {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const marker = `.openwork-conflict-${stamp}`;
+    const dot = path.lastIndexOf(".");
+    if (dot <= 0) {
+      return `${path}${marker}`;
+    }
+    return `${path.slice(0, dot)}${marker}${path.slice(dot)}`;
+  };
+
+  const runRemoteMirrorSyncTick = async () => {
+    if (remoteMirrorSyncInFlight) return;
+    if (remoteMirrorTrackedFiles.size === 0) {
+      stopRemoteMirrorSyncLoop();
+      return;
+    }
+
+    const client = props.openworkServerClient;
+    if (!client) {
+      stopRemoteMirrorSyncLoop();
+      return;
+    }
+
+    remoteMirrorSyncInFlight = true;
+    try {
+      let session = await ensureRemoteFileSyncSession();
+
+      const events = await client.listFileSessionEvents(session.id, { since: session.cursor });
+      if (events.cursor !== session.cursor) {
+        session = { ...session, cursor: events.cursor };
+        setRemoteFileSyncSession(session);
+      }
+
+      const refreshPaths = new Set<string>();
+      for (const event of events.items) {
+        if (event.type === "write" && remoteMirrorTrackedFiles.has(event.path)) {
+          const tracked = remoteMirrorTrackedFiles.get(event.path);
+          if (!tracked?.syncingLocal) {
+            refreshPaths.add(event.path);
+          }
+          continue;
+        }
+
+        if (event.type === "rename") {
+          const tracked = remoteMirrorTrackedFiles.get(event.path);
+          if (!tracked) continue;
+          remoteMirrorTrackedFiles.delete(event.path);
+          if (event.toPath?.trim()) {
+            const nextPath = event.toPath.trim();
+            remoteMirrorTrackedFiles.set(nextPath, {
+              ...tracked,
+              path: nextPath,
+            });
+            refreshPaths.add(nextPath);
+          }
+          continue;
+        }
+
+        if (event.type === "delete") {
+          remoteMirrorTrackedFiles.delete(event.path);
+        }
+      }
+
+      for (const path of refreshPaths) {
+        await refreshTrackedRemoteMirrorFile(session, path);
+      }
+
+      for (const [path, tracked] of remoteMirrorTrackedFiles) {
+        if (tracked.syncingLocal) continue;
+
+        const local = await readObsidianMirrorFile(remoteMirrorWorkspaceKey(), path);
+        if (!local.exists || local.content === null) continue;
+        const nextFingerprint = textFingerprint(local.content);
+        if (nextFingerprint === tracked.localFingerprint) continue;
+
+        tracked.syncingLocal = true;
+        try {
+          const write = await client.writeFileBatch(session.id, [
+            {
+              path,
+              contentBase64: utf8ToBase64(local.content),
+              ifMatchRevision: tracked.remoteRevision,
+            },
+          ]);
+          const item = write.items[0];
+          if (item?.ok) {
+            tracked.remoteRevision = item.revision;
+            tracked.localFingerprint = nextFingerprint;
+            continue;
+          }
+
+          if (!item?.ok && item?.code === "conflict") {
+            const conflictPath = createConflictPath(path);
+            await writeObsidianMirrorFile(remoteMirrorWorkspaceKey(), conflictPath, local.content);
+            await refreshTrackedRemoteMirrorFile(session, path);
+            setToastMessage(`Conflict syncing ${path}. Saved local changes to ${conflictPath}.`);
+            continue;
+          }
+
+          throw new Error(item?.message ?? `Unable to sync ${path}`);
+        } finally {
+          tracked.syncingLocal = false;
+        }
+      }
+    } catch (error) {
+      if (Date.now() - remoteMirrorLastErrorAt > 6_000) {
+        remoteMirrorLastErrorAt = Date.now();
+        const message = error instanceof Error ? error.message : "Remote file sync failed";
+        setToastMessage(message);
+      }
+    } finally {
+      remoteMirrorSyncInFlight = false;
+    }
+  };
+
+  const ensureRemoteMirrorSyncLoop = () => {
+    if (!isTauriRuntime()) return;
+    if (remoteMirrorTrackedFiles.size === 0) return;
+    if (remoteMirrorSyncTimer !== undefined) return;
+    remoteMirrorSyncTimer = window.setInterval(() => {
+      void runRemoteMirrorSyncTick();
+    }, 2500);
+    void runRemoteMirrorSyncTick();
+  };
+
+  const mirrorRemoteArtifactForObsidian = async (file: string) => {
+    const session = await ensureRemoteFileSyncSession();
+    const client = props.openworkServerClient;
+    if (!client) {
+      throw new Error("Connect to OpenWork server to sync remote files.");
+    }
+
+    const candidates = toRemoteArtifactCandidates(file);
+    if (candidates.length === 0) {
+      throw new Error("Only worker-relative files can be opened in Obsidian.");
+    }
+
+    let lastError: Error | null = null;
+    for (const candidate of candidates) {
+      try {
+        const result = await client.readFileBatch(session.id, [candidate]);
+        const item = result.items[0];
+        if (!item?.ok) {
+          if (item?.code === "file_not_found") continue;
+          throw new Error(item?.message ?? `Unable to read ${candidate}`);
+        }
+
+        const content = base64ToUtf8(item.contentBase64);
+        const localPath = await writeObsidianMirrorFile(remoteMirrorWorkspaceKey(), candidate, content);
+        const local = await readObsidianMirrorFile(remoteMirrorWorkspaceKey(), candidate);
+        const fingerprint = textFingerprint(local.content ?? content);
+
+        remoteMirrorTrackedFiles.set(candidate, {
+          path: candidate,
+          localPath,
+          remoteRevision: item.revision,
+          localFingerprint: fingerprint,
+          syncingLocal: false,
+        });
+        ensureRemoteMirrorSyncLoop();
+        return localPath;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+
+    throw lastError ?? new Error("Unable to open file in Obsidian");
+  };
+
+  createEffect(
+    on(
+      () =>
+        [
+          isTauriRuntime(),
+          props.activeWorkspaceDisplay.workspaceType,
+          props.openworkServerWorkspaceId?.trim() ?? "",
+          Boolean(props.openworkServerClient),
+        ] as const,
+      ([desktopRuntime, workspaceType, workspaceId, hasClient], previous) => {
+        const previousWorkspaceId = previous?.[2] ?? "";
+        const hasRemoteContext = desktopRuntime && workspaceType === "remote" && workspaceId.length > 0 && hasClient;
+        if (!hasRemoteContext) {
+          if (remoteFileSyncSession() || remoteMirrorTrackedFiles.size > 0 || remoteMirrorSyncTimer !== undefined) {
+            void resetRemoteFileSync();
+          }
+          return;
+        }
+
+        if (previousWorkspaceId && previousWorkspaceId !== workspaceId) {
+          void resetRemoteFileSync();
+        }
+      },
+    ),
+  );
+
+  onCleanup(() => {
+    void resetRemoteFileSync();
+  });
 
   const revealArtifact = async (file: string) => {
     if (props.activeWorkspaceDisplay.workspaceType === "remote") {
@@ -773,16 +1326,21 @@ export default function SessionView(props: SessionViewProps) {
       return;
     }
     try {
-      const target = await resolveArtifactLocalPath(file);
-      if (!target) {
+      const { openPath, revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      const result = await runLocalFileAction(file, "reveal", async (candidate) => {
+        if (isWindowsPlatform()) {
+          await openPath(candidate);
+          return;
+        }
+        await revealItemInDir(candidate);
+      });
+      if (!result.ok && result.reason === "missing-root") {
         setToastMessage("Pick a worker to reveal files.");
         return;
       }
-      const { openPath, revealItemInDir } = await import("@tauri-apps/plugin-opener");
-      if (isWindowsPlatform()) {
-        await openPath(target);
-      } else {
-        await revealItemInDir(target);
+      if (!result.ok) {
+        setToastMessage(result.reason);
+        return;
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to reveal file";
@@ -796,21 +1354,39 @@ export default function SessionView(props: SessionViewProps) {
       setToastMessage("Obsidian is not available on this system.");
       return;
     }
-    if (props.activeWorkspaceDisplay.workspaceType === "remote") {
-      setToastMessage("Open in Obsidian is unavailable for remote workers.");
-      return;
-    }
     if (!isTauriRuntime()) {
       setToastMessage("Open in Obsidian is available in the desktop app.");
       return;
     }
+
+    const isRemoteWorkspace = props.activeWorkspaceDisplay.workspaceType === "remote";
+    const preferLocalOpen = !isRemoteWorkspace || isSandboxWorkspace();
+
     try {
-      const target = await resolveArtifactLocalPath(file);
-      if (!target) {
+      if (preferLocalOpen) {
+        const localResult = await runLocalFileAction(file, "obsidian", async (candidate) => {
+          await openInObsidian(candidate);
+        });
+        if (localResult.ok) {
+          return;
+        }
+        if (localResult.reason === "missing-root" && !isRemoteWorkspace) {
+          setToastMessage("Pick a worker to open files.");
+          return;
+        }
+        if (!isRemoteWorkspace) {
+          setToastMessage(localResult.reason);
+          return;
+        }
+      }
+
+      if (!isRemoteWorkspace) {
         setToastMessage("Pick a worker to open files.");
         return;
       }
-      await openInObsidian(target);
+
+      const mirrored = await mirrorRemoteArtifactForObsidian(file);
+      await openInObsidian(mirrored);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to open file in Obsidian";
       setToastMessage(message);
@@ -847,6 +1423,9 @@ export default function SessionView(props: SessionViewProps) {
     return `${todoCompletedCount()} out of ${total} tasks completed`;
   });
   const [shareWorkspaceId, setShareWorkspaceId] = createSignal<string | null>(null);
+  let initialAnchorRafA: number | undefined;
+  let initialAnchorRafB: number | undefined;
+  let initialAnchorGuardTimer: ReturnType<typeof setTimeout> | undefined;
   const attachmentsEnabled = createMemo(() => {
     if (props.activeWorkspaceDisplay.workspaceType !== "remote") return true;
     return props.openworkServerStatus === "connected";
@@ -861,6 +1440,10 @@ export default function SessionView(props: SessionViewProps) {
 
   const scrollToLatest = (behavior: ScrollBehavior = "auto") => {
     messagesEndEl?.scrollIntoView({ behavior, block: "end" });
+  };
+
+  const pinToLatestNow = () => {
+    messagesEndEl?.scrollIntoView({ behavior: "auto", block: "end" });
   };
 
   const scheduleScrollToLatest = (behavior: ScrollBehavior = "auto") => {
@@ -881,7 +1464,43 @@ export default function SessionView(props: SessionViewProps) {
     });
   };
 
+  const cancelInitialAnchorFrames = () => {
+    if (initialAnchorRafA !== undefined) {
+      window.cancelAnimationFrame(initialAnchorRafA);
+      initialAnchorRafA = undefined;
+    }
+    if (initialAnchorRafB !== undefined) {
+      window.cancelAnimationFrame(initialAnchorRafB);
+      initialAnchorRafB = undefined;
+    }
+    if (initialAnchorGuardTimer) {
+      clearTimeout(initialAnchorGuardTimer);
+      initialAnchorGuardTimer = undefined;
+    }
+  };
+
+  const applyInitialBottomAnchor = (sessionId: string) => {
+    cancelInitialAnchorFrames();
+    initialAnchorGuardTimer = setTimeout(() => {
+      initialAnchorGuardTimer = undefined;
+      if (props.selectedSessionId !== sessionId) return;
+      setInitialAnchorPending(false);
+    }, 200);
+    pinToLatestNow();
+    initialAnchorRafA = window.requestAnimationFrame(() => {
+      initialAnchorRafA = undefined;
+      pinToLatestNow();
+      initialAnchorRafB = window.requestAnimationFrame(() => {
+        initialAnchorRafB = undefined;
+        pinToLatestNow();
+        if (props.selectedSessionId !== sessionId) return;
+        setInitialAnchorPending(false);
+      });
+    });
+  };
+
   onCleanup(() => {
+    cancelInitialAnchorFrames();
     if (scrollFrame !== undefined) {
       window.cancelAnimationFrame(scrollFrame);
       scrollFrame = undefined;
@@ -956,13 +1575,17 @@ export default function SessionView(props: SessionViewProps) {
 
     try {
       const { openPath } = await import("@tauri-apps/plugin-opener");
-      const root = props.activeWorkspaceRoot.trim();
-      if (!isAbsolutePath(trimmed) && !root) {
+      const result = await runLocalFileAction(trimmed, "open", async (candidate) => {
+        await openPath(candidate);
+      });
+      if (!result.ok && result.reason === "missing-root") {
         setToastMessage("Pick a worker to open files.");
         return;
       }
-      const target = !isAbsolutePath(trimmed) && root ? await join(root, trimmed) : trimmed;
-      await openPath(target);
+      if (!result.ok) {
+        setToastMessage(result.reason);
+        return;
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to open file";
       setToastMessage(message);
@@ -1146,6 +1769,34 @@ export default function SessionView(props: SessionViewProps) {
     return null;
   });
 
+  const runProgressSignature = createMemo(() => {
+    if (!showRunIndicator()) return "";
+    const part = latestRunPart();
+    const partTotal = totalPartCount();
+    if (!part) {
+      return `messages:${props.messages.length}:parts:${partTotal}:todos:${props.todos.length}`;
+    }
+
+    if (part.type === "reasoning" || part.type === "text") {
+      const text = typeof (part as any).text === "string" ? (part as any).text : "";
+      return `${part.type}:${text.length}:${text.slice(-48)}:parts:${partTotal}:todos:${props.todos.length}`;
+    }
+
+    if (part.type === "tool") {
+      const state = (part as any).state ?? {};
+      const status = typeof state.status === "string" ? state.status : "";
+      const outputSize =
+        typeof state.output === "string"
+          ? state.output.length
+          : Array.isArray(state.output)
+            ? state.output.length
+            : 0;
+      return `tool:${status}:${outputSize}:parts:${partTotal}:todos:${props.todos.length}`;
+    }
+
+    return `${part.type}:parts:${partTotal}:todos:${props.todos.length}`;
+  });
+
   const runLabel = createMemo(() => {
     switch (runPhase()) {
       case "sending":
@@ -1203,7 +1854,10 @@ export default function SessionView(props: SessionViewProps) {
   createEffect(
     on(
       () => props.selectedSessionId,
-      (sessionId) => {
+      (sessionId, previousSessionId) => {
+        if (sessionId === previousSessionId) {
+          return;
+        }
         setSearchOpen(false);
         setSearchQuery("");
         setSearchQueryDebounced("");
@@ -1212,22 +1866,39 @@ export default function SessionView(props: SessionViewProps) {
         if (!sessionId) return;
         const firstVisit = !topInitializedSessionIds.has(sessionId);
         topInitializedSessionIds.add(sessionId);
+        setInitialAnchorPending(true);
 
         if (!firstVisit) {
           queueMicrotask(() => {
-            if (nearBottom()) {
-              scheduleScrollToLatest("auto");
-            }
+            applyInitialBottomAnchor(sessionId);
           });
           return;
         }
 
         queueMicrotask(() => {
-          const container = chatContainerEl;
-          if (!container) return;
-          container.scrollTop = 0;
+          applyInitialBottomAnchor(sessionId);
         });
       },
+    ),
+  );
+
+  createEffect(
+    on(
+      () => [props.selectedSessionId, props.messages.length, isChatContainerReady(), initialAnchorPending()] as const,
+      ([sessionId, count, ready, pending]) => {
+        if (!pending) return;
+        if (!sessionId) {
+          setInitialAnchorPending(false);
+          return;
+        }
+        if (!ready) return;
+        if (count === 0) {
+          setInitialAnchorPending(false);
+          return;
+        }
+        queueMicrotask(() => applyInitialBottomAnchor(sessionId));
+      },
+      { defer: true },
     ),
   );
 
@@ -1246,6 +1917,7 @@ export default function SessionView(props: SessionViewProps) {
   createEffect(() => {
     const active = activeSearchHit();
     if (!active) return;
+    if (scrollMessageIntoViewById?.(active.messageId, "smooth")) return;
     const container = chatContainerEl;
     if (!container) return;
     const escapedId = active.messageId.replace(/"/g, '\\"');
@@ -1371,6 +2043,14 @@ export default function SessionView(props: SessionViewProps) {
     setRunTick(Date.now());
     const id = window.setInterval(() => setRunTick(Date.now()), 50);
     onCleanup(() => window.clearInterval(id));
+  });
+
+  createEffect(() => {
+    if (!showRunIndicator()) return;
+    runProgressSignature();
+    if (initialAnchorPending()) return;
+    if (!nearBottom()) return;
+    scheduleScrollToLatest("auto");
   });
 
   createEffect(
@@ -1710,6 +2390,10 @@ export default function SessionView(props: SessionViewProps) {
     }
     return "";
   });
+  const hasWorkspaceConfigured = createMemo(() => props.workspaces.length > 0);
+  const showWorkspaceSetupEmptyState = createMemo(
+    () => !hasWorkspaceConfigured() && !props.selectedSessionId && props.messages.length === 0,
+  );
 
   const renameCanSave = createMemo(() => {
     if (renameBusy()) return false;
@@ -1844,15 +2528,19 @@ export default function SessionView(props: SessionViewProps) {
   };
 
   const handleProviderAuthOAuth = async (providerId: string, methodIndex: number, code?: string) => {
-    if (providerAuthActionBusy()) return;
+    if (providerAuthActionBusy()) return { connected: false, pending: true };
     setProviderAuthActionBusy(true);
     try {
-      const message = await props.completeProviderAuthOAuth(providerId, methodIndex, code);
-      setToastMessage(message || "Provider connected");
-      props.closeProviderAuthModal();
+      const result = await props.completeProviderAuthOAuth(providerId, methodIndex, code);
+      if (result.connected) {
+        setToastMessage(result.message || "Provider connected");
+        props.closeProviderAuthModal();
+      }
+      return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : "OAuth failed";
       setToastMessage(message);
+      return { connected: false };
     } finally {
       setProviderAuthActionBusy(false);
     }
@@ -2260,58 +2948,10 @@ export default function SessionView(props: SessionViewProps) {
     props.sendPromptAsync(draft).catch(() => undefined);
   };
 
-  const handleBrowserAutomationQuickstart = async () => {
-    const name = BROWSER_SETUP_TEMPLATE.name;
-    try {
-      const commands = await props.listCommands();
-      const hasCommand = commands.some((cmd) => cmd.name === name);
-      if (hasCommand) {
-        handleSendPrompt({
-          mode: "prompt",
-          text: `/${name}`,
-          resolvedText: `/${name}`,
-          parts: [{ type: "text", text: `/${name}` }],
-          attachments: [],
-          command: { name, arguments: "" },
-        });
-        return;
-      }
-    } catch {
-      // Fall back to prompt-based setup below.
-    }
-
-    const text = BROWSER_SETUP_TEMPLATE.body || "Help me set up browser automation.";
-    handleSendPrompt({
-      mode: "prompt",
-      text,
-      resolvedText: text,
-      parts: [{ type: "text", text }],
-      attachments: [],
-    });
-  };
-
-  const handleSoulQuickstart = async () => {
-    const name = SOUL_SETUP_TEMPLATE.name;
-    const slashCommand = `/${name}`;
-    try {
-      const commands = await props.listCommands();
-      const hasCommand = commands.some((cmd) => cmd.name === name);
-      if (hasCommand) {
-        handleSendPrompt({
-          mode: "prompt",
-          text: slashCommand,
-          resolvedText: slashCommand,
-          parts: [{ type: "text", text: slashCommand }],
-          attachments: [],
-          command: { name, arguments: "" },
-        });
-        return;
-      }
-    } catch {
-      // Fall back to prompt-based setup below.
-    }
-
-    const text = SOUL_SETUP_TEMPLATE.body || "Give me a soul.";
+  const handleBrowserAutomationQuickstart = () => {
+    const text =
+      BROWSER_AUTOMATION_QUICKSTART_PROMPT ||
+      "Try Chrome DevTools MCP now. If it is unavailable, explain how to connect Control Chrome in OpenWork and ask me to retry.";
     handleSendPrompt({
       mode: "prompt",
       text,
@@ -2647,24 +3287,6 @@ export default function SessionView(props: SessionViewProps) {
     props.setView("dashboard");
   };
 
-  const openSoul = (workspaceId?: string) => {
-    const id = (workspaceId ?? props.activeWorkspaceId).trim();
-    if (!id) return;
-    void (async () => {
-      if (id !== props.activeWorkspaceId) {
-        await Promise.resolve(props.activateWorkspace(id));
-      }
-      props.setTab("soul");
-      props.setView("dashboard");
-    })();
-  };
-
-  const soulModeEnabled = createMemo(() =>
-    Boolean(props.soulStatusByWorkspaceId[props.activeWorkspaceId]?.enabled)
-  );
-
-  const soulNavIconClass = () => (soulModeEnabled() ? "soul-nav-icon-active" : "");
-
   const openProviderAuth = () => {
     void props.openProviderAuthModal().catch((error) => {
       const message = error instanceof Error ? error.message : "Connect failed";
@@ -2672,9 +3294,42 @@ export default function SessionView(props: SessionViewProps) {
     });
   };
 
+  const rightSidebarNavButton = (
+    label: string,
+    icon: any,
+    active: boolean,
+    onClick: () => void,
+  ) => (
+    <button
+      type="button"
+      class={`w-full border text-[13px] font-medium transition-[background-color,border-color,box-shadow,color] ${
+        active
+          ? "border-dls-border bg-dls-surface text-dls-text shadow-[var(--dls-card-shadow)]"
+          : "border-transparent text-gray-10 hover:border-dls-border hover:bg-dls-surface hover:text-dls-text"
+      } ${
+        rightSidebarExpanded()
+          ? "flex min-h-11 items-center justify-start gap-2.5 rounded-[16px] px-3.5"
+          : "flex h-12 items-center justify-center rounded-[16px] px-0"
+      }`}
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+    >
+      {icon}
+      <Show when={rightSidebarExpanded()}>{label}</Show>
+    </button>
+  );
+
   return (
-    <div class="flex h-screen w-full bg-dls-sidebar text-gray-12 font-sans overflow-hidden">
-      <aside class="w-[260px] hidden lg:flex flex-col bg-dls-sidebar border-r border-gray-6/70 p-3 pt-5">
+    <div class="h-screen w-full overflow-hidden bg-[var(--dls-app-bg)] p-3 md:p-4 text-gray-12 font-sans">
+      <div class="flex h-full w-full gap-3 md:gap-4">
+      <aside
+        class="relative hidden lg:flex shrink-0 flex-col rounded-[24px] border border-dls-border bg-dls-sidebar p-2.5"
+        style={{
+          width: `${leftSidebarWidth()}px`,
+          "min-width": `${leftSidebarWidth()}px`,
+        }}
+      >
         <div class="flex-1 overflow-y-auto">
           <Show when={showUpdatePill()}>
             <button
@@ -2707,16 +3362,16 @@ export default function SessionView(props: SessionViewProps) {
             workspaceSessionGroups={props.workspaceSessionGroups}
             activeWorkspaceId={props.activeWorkspaceId}
             selectedSessionId={props.selectedSessionId}
+            sessionStatusById={props.sessionStatusById}
             connectingWorkspaceId={props.connectingWorkspaceId}
+            workspaceConnectionStateById={props.workspaceConnectionStateById}
             newTaskDisabled={props.newTaskDisabled}
             importingWorkspaceConfig={props.importingWorkspaceConfig}
-            soulStatusByWorkspaceId={props.soulStatusByWorkspaceId}
             onActivateWorkspace={props.activateWorkspace}
             onOpenSession={openSessionFromList}
             onCreateTaskInWorkspace={createTaskInWorkspace}
             onOpenRenameWorkspace={props.openRenameWorkspace}
             onShareWorkspace={(workspaceId) => setShareWorkspaceId(workspaceId)}
-            onOpenSoul={openSoul}
             onRevealWorkspace={revealWorkspaceInFinder}
             onRecoverWorkspace={props.recoverWorkspace}
             onTestWorkspaceConnection={props.testWorkspaceConnection}
@@ -2727,12 +3382,18 @@ export default function SessionView(props: SessionViewProps) {
             onImportWorkspaceConfig={props.importWorkspaceConfig}
           />
         </div>
+        <div
+          class="absolute right-0 top-3 hidden h-[calc(100%-24px)] w-2 translate-x-1/2 cursor-col-resize rounded-full bg-transparent transition-colors hover:bg-gray-6/40 lg:block"
+          onPointerDown={startLeftSidebarResize}
+          title="Resize workspace column"
+          aria-label="Resize workspace column"
+        />
 
       </aside>
 
-      <main class="flex-1 flex flex-col overflow-hidden bg-gray-1">
-        <header class="h-14 border-b border-gray-5 flex items-center justify-between px-6 bg-gray-1 z-10 shrink-0">
-          <div class="flex items-center gap-3 min-w-0">
+      <main class="min-w-0 flex-1 flex flex-col overflow-hidden rounded-[24px] border border-dls-border bg-dls-surface shadow-[var(--dls-shell-shadow)]">
+        <header class="z-10 flex h-12 shrink-0 items-center justify-between border-b border-dls-border bg-dls-surface px-4 md:px-6">
+          <div class="flex min-w-0 items-center gap-3">
             <Show when={showUpdatePill()}>
               <button
                 type="button"
@@ -2761,22 +3422,33 @@ export default function SessionView(props: SessionViewProps) {
               </button>
             </Show>
 
-            <h1 class="text-[13.5px] font-medium text-gray-11 truncate">{selectedSessionTitle() || "Explore and identify available topics"}</h1>
+            <span class="shrink-0 rounded-md bg-dls-hover px-2 py-1 text-[11px] font-medium text-dls-secondary">
+              {showWorkspaceSetupEmptyState()
+                ? "Worker"
+                : props.activeWorkspaceDisplay.workspaceType === "remote"
+                  ? "Remote worker"
+                  : "Worker"}
+            </span>
+            <h1 class="truncate text-[15px] font-semibold text-dls-text">
+              {showWorkspaceSetupEmptyState()
+                ? "Create or connect a worker"
+                : (selectedSessionTitle() || "New session")}
+            </h1>
             <Show when={props.developerMode}>
-              <span class="text-xs text-dls-secondary">{props.headerStatus}</span>
+              <span class="hidden text-[12px] text-dls-secondary lg:inline">{props.headerStatus}</span>
             </Show>
             <Show when={props.busyHint}>
-              <span class="text-xs text-dls-secondary">· {props.busyHint}</span>
+              <span class="hidden text-[12px] text-dls-secondary lg:inline">{props.busyHint}</span>
             </Show>
           </div>
 
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-1.5 text-gray-10">
             <button
               type="button"
-              class={`h-9 px-2.5 flex items-center justify-center rounded-lg text-[11px] font-mono transition-colors ${
+              class={`hidden items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] font-medium transition-colors sm:flex ${
                 commandPaletteOpen()
-                  ? "bg-gray-4 text-gray-12"
-                  : "text-gray-10 hover:text-gray-12 hover:bg-gray-3"
+                  ? "bg-gray-2 text-dls-text"
+                  : "text-gray-10 hover:bg-gray-2/70 hover:text-dls-text"
               }`}
               onClick={(event) => {
                 event.preventDefault();
@@ -2790,14 +3462,16 @@ export default function SessionView(props: SessionViewProps) {
               title="Quick actions (Ctrl/Cmd+K)"
               aria-label="Quick actions"
             >
-              Cmd+K
+              <Menu size={15} />
+              <span>Menu</span>
+              <span class="ml-1 rounded border border-dls-border px-1 text-[10px] text-gray-9">⌘K</span>
             </button>
             <button
               type="button"
-              class={`h-9 w-9 flex items-center justify-center rounded-lg transition-colors ${
+              class={`flex h-9 w-9 items-center justify-center rounded-md transition-colors ${
                 searchOpen()
-                  ? "bg-gray-4 text-gray-12"
-                  : "text-gray-10 hover:text-gray-12 hover:bg-gray-3"
+                  ? "bg-gray-2 text-dls-text"
+                  : "text-gray-10 hover:bg-gray-2/70 hover:text-dls-text"
               }`}
               onClick={() => {
                 if (searchOpen()) {
@@ -2811,9 +3485,10 @@ export default function SessionView(props: SessionViewProps) {
             >
               <Search size={16} />
             </button>
+            <div class="hidden h-4 w-px bg-dls-border sm:block" />
             <button
               type="button"
-              class="h-9 w-9 flex items-center justify-center rounded-lg text-gray-10 hover:text-gray-12 hover:bg-gray-3 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+              class="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[13px] font-medium text-gray-10 transition-colors hover:bg-gray-2/70 hover:text-dls-text disabled:cursor-not-allowed disabled:opacity-60"
               onClick={undoLastMessage}
               disabled={!canUndoLastMessage() || historyActionBusy() !== null}
               title="Undo last message"
@@ -2822,10 +3497,11 @@ export default function SessionView(props: SessionViewProps) {
               <Show when={historyActionBusy() === "undo"} fallback={<Undo2 size={16} />}>
                 <Loader2 size={16} class="animate-spin" />
               </Show>
+              <span class="hidden lg:inline">Revert</span>
             </button>
             <button
               type="button"
-              class="h-9 w-9 flex items-center justify-center rounded-lg text-gray-10 hover:text-gray-12 hover:bg-gray-3 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+              class="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[13px] font-medium text-gray-10 transition-colors hover:bg-gray-2/70 hover:text-dls-text disabled:cursor-not-allowed disabled:opacity-60"
               onClick={redoLastMessage}
               disabled={!canRedoLastMessage() || historyActionBusy() !== null}
               title="Redo last reverted message"
@@ -2834,10 +3510,12 @@ export default function SessionView(props: SessionViewProps) {
               <Show when={historyActionBusy() === "redo"} fallback={<Redo2 size={16} />}>
                 <Loader2 size={16} class="animate-spin" />
               </Show>
+              <span class="hidden lg:inline">Redo</span>
             </button>
+            <div class="hidden h-4 w-px bg-dls-border sm:block" />
             <button
               type="button"
-              class="h-9 w-9 flex items-center justify-center rounded-lg text-gray-10 hover:text-gray-12 hover:bg-gray-3 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+              class="flex h-9 w-9 items-center justify-center rounded-md text-gray-10 transition-colors hover:bg-gray-2/70 hover:text-dls-text disabled:cursor-not-allowed disabled:opacity-60"
               onClick={compactSessionHistory}
               disabled={!canCompactSession() || historyActionBusy() !== null}
               title="Compact session context"
@@ -2850,7 +3528,7 @@ export default function SessionView(props: SessionViewProps) {
             <div ref={(el) => (sessionMenuRef = el)} class="relative">
               <button
                 type="button"
-                class="h-9 w-9 flex items-center justify-center rounded-lg text-gray-10 hover:text-gray-12 hover:bg-gray-3 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                class="flex h-9 w-9 items-center justify-center rounded-md text-gray-10 transition-colors hover:bg-gray-2/70 hover:text-dls-text disabled:cursor-not-allowed disabled:opacity-60"
                 disabled={!props.selectedSessionId}
                 title={props.selectedSessionId ? "Session actions" : "Select a session to manage it"}
                 aria-label={props.selectedSessionId ? "Session actions" : "Select a session to manage it"}
@@ -2865,12 +3543,12 @@ export default function SessionView(props: SessionViewProps) {
 
               <Show when={sessionMenuOpen() && props.selectedSessionId}>
                 <div
-                  class="absolute right-0 top-[calc(100%+4px)] z-20 w-52 rounded-lg border border-gray-6 bg-gray-1 shadow-lg p-1"
+                  class="absolute right-0 top-[calc(100%+6px)] z-20 w-52 rounded-[18px] border border-dls-border bg-dls-surface p-1.5 shadow-[var(--dls-shell-shadow)]"
                   onClick={(event) => event.stopPropagation()}
                 >
                   <button
                     type="button"
-                    class="w-full text-left px-2 py-1.5 text-sm rounded-md hover:bg-gray-3 disabled:opacity-60"
+                    class="w-full rounded-xl px-3 py-2 text-left text-sm text-gray-11 transition-colors hover:bg-gray-2 disabled:opacity-60"
                     onClick={() => {
                       setSessionMenuOpen(false);
                       void compactSessionHistory();
@@ -2881,14 +3559,14 @@ export default function SessionView(props: SessionViewProps) {
                   </button>
                   <button
                     type="button"
-                    class="w-full text-left px-2 py-1.5 text-sm rounded-md hover:bg-gray-3"
+                    class="w-full rounded-xl px-3 py-2 text-left text-sm text-gray-11 transition-colors hover:bg-gray-2"
                     onClick={openRenameModal}
                   >
                     Rename session
                   </button>
                   <button
                     type="button"
-                    class="w-full text-left px-2 py-1.5 text-sm rounded-md hover:bg-gray-3 text-red-11"
+                    class="w-full rounded-xl px-3 py-2 text-left text-sm text-red-11 transition-colors hover:bg-red-1/40"
                     onClick={openDeleteSessionModal}
                   >
                     Delete session
@@ -2900,8 +3578,8 @@ export default function SessionView(props: SessionViewProps) {
         </header>
 
         <Show when={searchOpen()}>
-          <div class="border-b border-gray-5 bg-gray-2/70 px-6 py-2">
-            <div class="mx-auto flex w-full max-w-[800px] items-center gap-2 rounded-xl border border-gray-6 bg-gray-1 px-3 py-2">
+          <div class="border-b border-dls-border bg-dls-sidebar/70 px-4 py-2 md:px-6">
+            <div class="mx-auto flex w-full max-w-[800px] items-center gap-2 rounded-[16px] border border-dls-border bg-dls-surface px-3 py-2 shadow-[var(--dls-card-shadow)]">
               <Search size={14} class="text-gray-9" />
               <input
                 ref={(el) => (searchInputEl = el)}
@@ -2929,7 +3607,7 @@ export default function SessionView(props: SessionViewProps) {
               <span class="text-[11px] text-gray-10 tabular-nums">{activeSearchPositionLabel()}</span>
               <button
                 type="button"
-                class="rounded-md border border-gray-6 px-2 py-1 text-[11px] text-gray-10 hover:text-gray-12 hover:bg-gray-3 transition-colors disabled:opacity-60"
+                class="rounded-md border border-dls-border px-2 py-1 text-[11px] text-gray-10 transition-colors hover:bg-gray-2 hover:text-gray-12 disabled:opacity-60"
                 disabled={searchHits().length === 0}
                 onClick={() => moveSearchHit(-1)}
                 aria-label="Previous match"
@@ -2938,7 +3616,7 @@ export default function SessionView(props: SessionViewProps) {
               </button>
               <button
                 type="button"
-                class="rounded-md border border-gray-6 px-2 py-1 text-[11px] text-gray-10 hover:text-gray-12 hover:bg-gray-3 transition-colors disabled:opacity-60"
+                class="rounded-md border border-dls-border px-2 py-1 text-[11px] text-gray-10 transition-colors hover:bg-gray-2 hover:text-gray-12 disabled:opacity-60"
                 disabled={searchHits().length === 0}
                 onClick={() => moveSearchHit(1)}
                 aria-label="Next match"
@@ -2947,7 +3625,7 @@ export default function SessionView(props: SessionViewProps) {
               </button>
               <button
                 type="button"
-                class="h-7 w-7 flex items-center justify-center rounded-md text-gray-10 hover:text-gray-12 hover:bg-gray-3 transition-colors"
+                class="flex h-7 w-7 items-center justify-center rounded-md text-gray-10 transition-colors hover:bg-gray-2 hover:text-gray-12"
                 onClick={closeSearch}
                 aria-label="Close search"
               >
@@ -2957,26 +3635,103 @@ export default function SessionView(props: SessionViewProps) {
           </div>
         </Show>
 
+        <Show when={props.showSkillReloadBanner}>
+          <div class="border-b border-amber-6/50 bg-amber-2/70 px-6 py-3">
+            <div class="mx-auto flex w-full max-w-[800px] flex-col gap-3 rounded-2xl border border-amber-6/60 bg-amber-1/80 px-4 py-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+              <div class="min-w-0">
+                <div class="text-sm font-medium text-amber-11">{props.reloadBannerTitle}</div>
+                <div class="mt-0.5 text-xs text-amber-11/80">
+                  {props.reloadBannerBody}
+                  <Show when={props.reloadBannerBlocked}>
+                    <span>
+                      {` Reloading stops ${props.reloadBannerActiveCount} active conversation${props.reloadBannerActiveCount === 1 ? "" : "s"}.`}
+                    </span>
+                  </Show>
+                </div>
+                <Show when={props.reloadError}>
+                  <div class="mt-1 text-xs text-red-11">{props.reloadError}</div>
+                </Show>
+              </div>
+
+              <div class="flex items-center gap-2 sm:shrink-0">
+                <button
+                  type="button"
+                  class="rounded-xl border border-amber-7 bg-amber-4 px-3 py-2 text-xs font-medium text-amber-12 transition-colors hover:bg-amber-5 disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={!props.canReloadWorkspace || props.reloadBusy}
+                  onClick={() =>
+                    void (props.reloadBannerBlocked
+                      ? props.forceStopActiveConversations()
+                      : props.reloadWorkspaceEngine())
+                  }
+                >
+                  {props.reloadBusy
+                    ? "Reloading..."
+                    : props.reloadBannerBlocked
+                      ? "Reload & Stop Tasks"
+                      : "Reload"}
+                </button>
+                <button
+                  type="button"
+                  class="rounded-xl border border-amber-6/70 bg-transparent px-3 py-2 text-xs font-medium text-amber-11 transition-colors hover:bg-amber-3"
+                  onClick={props.dismissReloadBanner}
+                >
+                  Later
+                </button>
+              </div>
+            </div>
+          </div>
+        </Show>
+
         <div class="flex-1 flex overflow-hidden">
-          <div class="flex-1 min-w-0 relative overflow-hidden bg-gray-1">
+          <div class="relative min-w-0 flex-1 overflow-hidden bg-dls-surface">
             <div
-              class="h-full overflow-y-auto px-8 pt-12 pb-56 scroll-smooth bg-gray-1"
+              class={`h-full overflow-y-auto px-4 sm:px-6 lg:px-10 ${showWorkspaceSetupEmptyState() ? "pt-20 pb-20" : "pt-10 pb-60"} scroll-smooth bg-dls-surface ${initialAnchorPending() ? "invisible" : "visible"}`}
               style={{ contain: "layout paint style" }}
-              ref={(el) => (chatContainerEl = el)}
+              ref={(el) => {
+                chatContainerEl = el;
+                setIsChatContainerReady(Boolean(el));
+              }}
             >
-              <div class="max-w-[650px] mx-auto w-full">
-           <Show when={props.messages.length === 0}>
-             <div class="text-center py-16 px-6 space-y-6">
-               <div class="w-16 h-16 bg-dls-hover rounded-3xl mx-auto flex items-center justify-center border border-dls-border">
-                 <Zap class="text-dls-secondary" />
-               </div>
+              <div class="mx-auto w-full max-w-[800px]">
+            <Show when={showWorkspaceSetupEmptyState()}>
+              <div class="mx-auto max-w-xl rounded-[24px] border border-dls-border bg-dls-sidebar p-8 text-center shadow-[var(--dls-card-shadow)]">
+                <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-dls-border bg-dls-surface text-gray-11">
+                  <HardDrive size={24} />
+                </div>
+                <h3 class="text-2xl font-semibold text-gray-12">Set up your first worker</h3>
+                <p class="mt-2 text-sm text-gray-10">
+                  OpenWork needs a local or remote worker before you can start a session.
+                </p>
+                <div class="mt-6 grid gap-3 sm:grid-cols-2">
+                  <button
+                    type="button"
+                    class="rounded-full border border-gray-7 bg-gray-12 px-5 py-3 text-sm font-semibold text-gray-1 transition-colors hover:bg-gray-11"
+                    onClick={props.openCreateWorkspace}
+                  >
+                    Create local worker
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded-full border border-dls-border bg-dls-surface px-5 py-3 text-sm font-semibold text-gray-12 transition-colors hover:bg-gray-2"
+                    onClick={props.openCreateRemoteWorkspace}
+                  >
+                    Connect remote worker
+                  </button>
+                </div>
+              </div>
+            </Show>
+            <Show when={props.messages.length === 0 && !showWorkspaceSetupEmptyState()}>
+              <div class="text-center py-16 px-6 space-y-6">
+                <div class="w-16 h-16 bg-dls-hover rounded-3xl mx-auto flex items-center justify-center border border-dls-border">
+                  <Zap class="text-dls-secondary" />
+                </div>
               <div class="space-y-2">
                 <h3 class="text-xl font-medium">What do you want to do?</h3>
                 <p class="text-dls-secondary text-sm max-w-sm mx-auto">
                   Pick a starting point or just type below.
                 </p>
               </div>
-              <div class="grid gap-3 sm:grid-cols-2 max-w-2xl mx-auto text-left">
+              <div class="grid gap-3 max-w-lg mx-auto text-left">
                 <button
                   type="button"
                   class="rounded-2xl border border-dls-border bg-dls-hover p-4 transition-all hover:bg-dls-active hover:border-gray-7"
@@ -2992,30 +3747,32 @@ export default function SessionView(props: SessionViewProps) {
                 <button
                   type="button"
                   class="rounded-2xl border border-dls-border bg-dls-hover p-4 transition-all hover:bg-dls-active hover:border-gray-7"
-                  onClick={() => {
-                    void handleSoulQuickstart();
-                  }}
+                  onClick={openProviderAuth}
                 >
-                  <div class="text-sm font-semibold text-dls-text">Give me a soul</div>
+                  <div class="text-sm font-semibold text-dls-text">Connect ChatGPT for free</div>
                   <div class="mt-1 text-xs text-dls-secondary leading-relaxed">
-                    Keep your goals and preferences across sessions with light scheduled check-ins.
-                    Tradeoff: more autonomy can create extra background runs, but revert is one command.
-                    Audit setup and heartbeat evidence from the Soul section.
+                    Pro tip: connect your ChatGPT account to unlock a free provider path.
                   </div>
                 </button>
               </div>
             </div>
           </Show>
 
-          <Show when={hiddenMessageCount() > 0}>
+          <Show when={hiddenMessageCount() > 0 || hasServerEarlierMessages()}>
             <div class="mb-4 flex justify-center">
               <button
                 type="button"
                 class="rounded-full border border-dls-border bg-dls-hover/70 px-3 py-1 text-xs text-dls-secondary transition-colors hover:bg-dls-active hover:text-dls-text"
-                onClick={revealEarlierMessages}
+                onClick={() => {
+                  void revealEarlierMessages();
+                }}
+                disabled={props.loadingEarlierMessages}
               >
-                Show {nextRevealCount().toLocaleString()} earlier message
-                {nextRevealCount() === 1 ? "" : "s"}
+                {props.loadingEarlierMessages
+                  ? "Loading earlier messages..."
+                  : hiddenMessageCount() > 0
+                    ? `Show ${nextRevealCount().toLocaleString()} earlier message${nextRevealCount() === 1 ? "" : "s"}`
+                    : "Load earlier messages"}
               </button>
             </div>
           </Show>
@@ -3032,6 +3789,10 @@ export default function SessionView(props: SessionViewProps) {
             searchMatchMessageIds={searchMatchMessageIds()}
             activeSearchMessageId={activeSearchHit()?.messageId ?? null}
             searchHighlightQuery={searchQueryDebounced().trim()}
+            scrollElement={() => chatContainerEl}
+            setScrollToMessageById={(handler) => {
+              scrollMessageIntoViewById = handler;
+            }}
             footer={
               showRunIndicator() ? (
                 <div class="flex justify-start pl-2">
@@ -3068,10 +3829,10 @@ export default function SessionView(props: SessionViewProps) {
 
             <Show when={props.messages.length > 0 && !nearBottom()}>
               <div class="absolute bottom-4 left-0 right-0 z-20 flex justify-center pointer-events-none">
-                <div class="pointer-events-auto flex items-center gap-2 rounded-full border border-gray-6 bg-gray-1/95 p-1 shadow-lg shadow-gray-12/5 backdrop-blur-md">
+                <div class="pointer-events-auto flex items-center gap-2 rounded-full border border-dls-border bg-dls-surface/95 p-1 shadow-[var(--dls-card-shadow)] backdrop-blur-md">
                   <button
                     type="button"
-                    class="rounded-full px-3 py-1.5 text-xs text-gray-11 hover:bg-gray-3 transition-colors"
+                    class="rounded-full px-3 py-1.5 text-xs text-gray-11 transition-colors hover:bg-gray-2"
                     onClick={() => jumpToLatest("smooth")}
                   >
                     Jump to latest
@@ -3084,11 +3845,11 @@ export default function SessionView(props: SessionViewProps) {
         </div>
 
       <Show when={todoCount() > 0}>
-        <div class="mx-auto w-full max-w-[68ch] px-4">
-          <div class="rounded-t-xl border border-b-0 border-gray-6/70 bg-gray-1/70 shadow-sm shadow-gray-12/5">
+        <div class="mx-auto w-full max-w-[800px] px-4">
+          <div class="rounded-t-[20px] border border-b-0 border-dls-border bg-dls-surface shadow-[var(--dls-card-shadow)]">
             <button
               type="button"
-              class="w-full flex items-center justify-between px-4 py-2.5 text-xs text-gray-9 hover:bg-gray-2/50 transition-colors rounded-t-xl"
+              class="flex w-full items-center justify-between rounded-t-[20px] px-4 py-3 text-xs text-gray-9 transition-colors hover:bg-gray-2/50"
               onClick={() => setTodoExpanded((prev) => !prev)}
             >
               <div class="flex items-center gap-2">
@@ -3101,7 +3862,7 @@ export default function SessionView(props: SessionViewProps) {
               />
             </button>
             <Show when={todoExpanded()}>
-              <div class="px-4 pb-3 space-y-2.5 max-h-60 overflow-auto border-t border-gray-6/50">
+              <div class="max-h-60 overflow-auto border-t border-dls-border px-4 pb-3 space-y-2.5">
                 <For each={todoList()}>
                   {(todo, index) => {
                     const done = () => todo.status === "completed";
@@ -3147,169 +3908,168 @@ export default function SessionView(props: SessionViewProps) {
         </div>
       </Show>
 
-      <Composer
-        prompt={props.prompt}
-        developerMode={props.developerMode}
-        busy={props.busy}
-        isStreaming={showRunIndicator()}
-        onSend={handleSendPrompt}
-        onStop={cancelRun}
-        onDraftChange={handleDraftChange}
-        selectedModelLabel={props.selectedSessionModelLabel || "Model"}
-        onModelClick={props.openSessionModelPicker}
-        modelVariantLabel={props.modelVariantLabel}
-        modelVariant={props.modelVariant}
-        onModelVariantChange={props.setModelVariant}
-        agentLabel={agentLabel()}
-        selectedAgent={props.selectedSessionAgent}
-        agentPickerOpen={agentPickerOpen()}
-        agentPickerBusy={agentPickerBusy()}
-        agentPickerError={agentPickerError()}
-        agentOptions={agentOptions()}
-        onToggleAgentPicker={openAgentPicker}
-        onSelectAgent={(agent) => {
-          applySessionAgent(agent);
-          setAgentPickerOpen(false);
-        }}
-        setAgentPickerRef={(el) => {
-          agentPickerRef = el;
-        }}
-        showNotionBanner={props.showTryNotionPrompt}
-        onNotionBannerClick={props.onTryNotionPrompt}
-        toast={toastMessage()}
-        onToast={(message) => setToastMessage(message)}
-        listAgents={props.listAgents}
-        recentFiles={props.workingFiles}
-        searchFiles={props.searchFiles}
-        listCommands={props.listCommands}
-        isRemoteWorkspace={props.activeWorkspaceDisplay.workspaceType === "remote"}
-        isSandboxWorkspace={isSandboxWorkspace()}
-        onUploadInboxFiles={uploadInboxFiles}
-        attachmentsEnabled={attachmentsEnabled()}
-        attachmentsDisabledReason={attachmentsDisabledReason()}
-      />
+      <Show when={!showWorkspaceSetupEmptyState()}>
+        <Composer
+          prompt={props.prompt}
+          developerMode={props.developerMode}
+          busy={props.busy}
+          isStreaming={showRunIndicator()}
+          compactTopSpacing={todoCount() > 0}
+          onSend={handleSendPrompt}
+          onStop={cancelRun}
+          onDraftChange={handleDraftChange}
+          selectedModelLabel={props.selectedSessionModelLabel || "Model"}
+          onModelClick={props.openSessionModelPicker}
+          modelVariantLabel={props.modelVariantLabel}
+          modelVariant={props.modelVariant}
+          onModelVariantChange={props.setModelVariant}
+          agentLabel={agentLabel()}
+          selectedAgent={props.selectedSessionAgent}
+          agentPickerOpen={agentPickerOpen()}
+          agentPickerBusy={agentPickerBusy()}
+          agentPickerError={agentPickerError()}
+          agentOptions={agentOptions()}
+          onToggleAgentPicker={openAgentPicker}
+          onSelectAgent={(agent) => {
+            applySessionAgent(agent);
+            setAgentPickerOpen(false);
+          }}
+          setAgentPickerRef={(el) => {
+            agentPickerRef = el;
+          }}
+          showNotionBanner={props.showTryNotionPrompt}
+          onNotionBannerClick={props.onTryNotionPrompt}
+          toast={toastMessage()}
+          onToast={(message) => setToastMessage(message)}
+          listAgents={props.listAgents}
+          recentFiles={props.workingFiles}
+          searchFiles={props.searchFiles}
+          listCommands={props.listCommands}
+          isRemoteWorkspace={props.activeWorkspaceDisplay.workspaceType === "remote"}
+          isSandboxWorkspace={isSandboxWorkspace()}
+          onUploadInboxFiles={uploadInboxFiles}
+          attachmentsEnabled={attachmentsEnabled()}
+          attachmentsDisabledReason={attachmentsDisabledReason()}
+        />
+      </Show>
 
         <StatusBar
           clientConnected={props.clientConnected}
           openworkServerStatus={props.openworkServerStatus}
           developerMode={props.developerMode}
-          onOpenSettings={() => openSettings("general")}
+          settingsOpen={false}
+          onOpenSettings={props.toggleSettings}
           onOpenMessaging={openConfig}
           onOpenProviders={openProviderAuth}
           onOpenMcp={openMcp}
           providerConnectedIds={props.providerConnectedIds}
           mcpStatuses={props.mcpStatuses}
+          statusLabel={showRunIndicator() ? "Session Active" : props.selectedSessionId ? "Session Ready" : "Session Idle"}
+          statusDetail={
+            showRunIndicator()
+              ? `${props.activeWorkspaceDisplay.name} is running`
+              : props.selectedSessionId
+                ? `${selectedSessionTitle() || props.activeWorkspaceDisplay.name} is ready`
+                : "Choose a worker to begin"
+          }
+          statusDotClass={showRunIndicator() ? "bg-green-9" : props.selectedSessionId ? "bg-green-9" : "bg-gray-8"}
+          statusPingClass={showRunIndicator() ? "bg-green-9/45 animate-ping" : "bg-green-9/35"}
+          statusPulse={showRunIndicator()}
         />
       </main>
 
-      <aside class="w-[280px] hidden xl:flex flex-col bg-dls-sidebar border-l border-gray-6/70 p-3">
-        <div class="flex-1 overflow-y-auto space-y-5 pt-2">
+      <aside
+        class="flex shrink-0 flex-col overflow-hidden rounded-[24px] border border-dls-border bg-dls-sidebar p-3 transition-[width] duration-200"
+        style={{
+          width: `${rightSidebarWidth()}px`,
+          "min-width": `${rightSidebarWidth()}px`,
+        }}
+      >
+        <div class={`flex items-center pb-3 ${rightSidebarExpanded() ? "justify-end" : "justify-center"}`}>
+          <button
+            type="button"
+            class="flex h-10 w-10 items-center justify-center rounded-[16px] text-gray-10 transition-colors hover:bg-dls-surface hover:text-dls-text"
+            onClick={toggleRightSidebar}
+            title={rightSidebarExpanded() ? "Collapse sidebar" : "Expand sidebar"}
+            aria-label={rightSidebarExpanded() ? "Collapse sidebar" : "Expand sidebar"}
+          >
+            <Show when={rightSidebarExpanded()} fallback={<ChevronLeft size={18} />}>
+              <ChevronRight size={18} />
+            </Show>
+          </button>
+        </div>
+        <div class={`flex-1 overflow-y-auto ${rightSidebarExpanded() ? "space-y-5 pt-1" : "space-y-3 pt-1"}`}>
           <div class="space-y-1 mb-2">
-          <button
-            type="button"
-            class={`w-full h-9 flex items-center gap-2.5 px-3 rounded-lg text-[13px] font-medium transition-colors ${
-              showRightSidebarSelection() && props.tab === "scheduled"
-                ? "bg-gray-4 text-gray-12"
-                : "text-gray-11 hover:text-gray-12 hover:bg-gray-3"
-            }`}
-            onClick={() => {
-              props.setTab("scheduled");
-              props.setView("dashboard");
-            }}
-          >
-            <History size={18} />
-            Automations
-          </button>
-          <button
-            type="button"
-            class={`w-full h-9 flex items-center gap-2.5 px-3 rounded-lg text-[13px] font-medium transition-colors ${
-              showRightSidebarSelection() && props.tab === "soul"
-                ? "bg-gray-4 text-gray-12"
-                : "text-gray-11 hover:text-gray-12 hover:bg-gray-3"
-            }`}
-            onClick={() => openSoul()}
-          >
-            <HeartPulse size={18} class={soulNavIconClass()} />
-            Soul
-          </button>
-          <button
-            type="button"
-            class={`w-full h-9 flex items-center gap-2.5 px-3 rounded-lg text-[13px] font-medium transition-colors ${
-              showRightSidebarSelection() && props.tab === "skills"
-                ? "bg-gray-4 text-gray-12"
-                : "text-gray-11 hover:text-gray-12 hover:bg-gray-3"
-            }`}
-            onClick={() => {
-              props.setTab("skills");
-              props.setView("dashboard");
-            }}
-          >
-            <Zap size={18} />
-            Skills
-          </button>
-          <button
-            type="button"
-            class={`w-full h-9 flex items-center gap-2.5 px-3 rounded-lg text-[13px] font-medium transition-colors ${
-              showRightSidebarSelection() && (props.tab === "mcp" || props.tab === "plugins")
-                ? "bg-gray-4 text-gray-12"
-                : "text-gray-11 hover:text-gray-12 hover:bg-gray-3"
-            }`}
-            onClick={() => {
-              props.setTab("mcp");
-              props.setView("dashboard");
-            }}
-          >
-            <Box size={18} />
-            Extensions
-          </button>
-          <button
-            type="button"
-            class={`w-full h-9 flex items-center gap-2.5 px-3 rounded-lg text-[13px] font-medium transition-colors ${
-              showRightSidebarSelection() && props.tab === "identities"
-                ? "bg-gray-4 text-gray-12"
-                : "text-gray-11 hover:text-gray-12 hover:bg-gray-3"
-            }`}
-            onClick={() => {
-              props.setTab("identities");
-              props.setView("dashboard");
-            }}
-          >
-            <MessageCircle size={18} />
-            Messaging
-          </button>
-          <Show when={props.developerMode}>
-            <button
-              type="button"
-              class={`w-full h-9 flex items-center gap-2.5 px-3 rounded-lg text-[13px] font-medium transition-colors ${
-                showRightSidebarSelection() && props.tab === "config"
-                  ? "bg-gray-4 text-gray-12"
-                  : "text-gray-11 hover:text-gray-12 hover:bg-gray-3"
-              }`}
-              onClick={openConfig}
-            >
-              <SlidersHorizontal size={18} />
-              Advanced
-            </button>
-          </Show>
+            {rightSidebarNavButton(
+              "Automations",
+              <History size={18} />,
+              showRightSidebarSelection() && props.tab === "scheduled",
+              () => {
+                props.setTab("scheduled");
+                props.setView("dashboard");
+              },
+            )}
+            {rightSidebarNavButton(
+              "Skills",
+              <Zap size={18} />,
+              showRightSidebarSelection() && props.tab === "skills",
+              () => {
+                props.setTab("skills");
+                props.setView("dashboard");
+              },
+            )}
+            {rightSidebarNavButton(
+              "Extensions",
+              <Box size={18} />,
+              showRightSidebarSelection() && (props.tab === "mcp" || props.tab === "plugins"),
+              () => {
+                props.setTab("mcp");
+                props.setView("dashboard");
+              },
+            )}
+            {rightSidebarNavButton(
+              "Messaging",
+              <MessageCircle size={18} />,
+              showRightSidebarSelection() && props.tab === "identities",
+              () => {
+                props.setTab("identities");
+                props.setView("dashboard");
+              },
+            )}
+            <Show when={props.developerMode}>
+              {rightSidebarNavButton(
+                "Advanced",
+                <SlidersHorizontal size={18} />,
+                showRightSidebarSelection() && props.tab === "config",
+                openConfig,
+              )}
+            </Show>
           </div>
 
-          <InboxPanel
-            id="sidebar-inbox"
-            client={props.openworkServerClient}
-            workspaceId={props.openworkServerWorkspaceId}
-            onToast={(message) => setToastMessage(message)}
-          />
+          <Show when={rightSidebarExpanded()}>
+            <div class="rounded-[20px] border border-dls-border bg-dls-surface p-3 shadow-[var(--dls-card-shadow)]">
+              <InboxPanel
+                id="sidebar-inbox"
+                client={props.openworkServerClient}
+                workspaceId={props.openworkServerWorkspaceId}
+                onToast={(message) => setToastMessage(message)}
+              />
+            </div>
 
-          <ArtifactsPanel
-            id="sidebar-artifacts"
-            files={touchedFiles()}
-            workspaceRoot={props.activeWorkspaceRoot}
-            onRevealArtifact={revealArtifact}
-            onOpenInObsidian={openArtifactInObsidian}
-            obsidianAvailable={obsidianAvailable()}
-          />
+            <div class="rounded-[20px] border border-dls-border bg-dls-surface p-3 shadow-[var(--dls-card-shadow)]">
+              <ArtifactsPanel
+                id="sidebar-artifacts"
+                files={touchedFiles()}
+                workspaceRoot={props.activeWorkspaceRoot}
+                onRevealArtifact={revealArtifact}
+                onOpenInObsidian={openArtifactInObsidian}
+                obsidianAvailable={obsidianAvailable()}
+              />
+            </div>
+          </Show>
         </div>
       </aside>
+      </div>
 
       <Show when={commandPaletteOpen()}>
         <div
@@ -3416,6 +4176,7 @@ export default function SessionView(props: SessionViewProps) {
         onSelect={handleProviderAuthSelect}
         onSubmitApiKey={handleProviderAuthApiKey}
         onSubmitOAuth={handleProviderAuthOAuth}
+        onRefreshProviders={props.refreshProviders}
         onClose={props.closeProviderAuthModal}
       />
 
@@ -3458,6 +4219,11 @@ export default function SessionView(props: SessionViewProps) {
         shareWorkspaceProfileError={shareWorkspaceProfileError()}
         shareWorkspaceProfileDisabledReason={shareServiceDisabledReason()}
         onShareSkillsSet={publishSkillsSetLink}
+        onOpenSingleSkillShare={() => {
+          setShareWorkspaceId(null);
+          props.setTab("skills");
+          props.setView("dashboard");
+        }}
         shareSkillsSetBusy={shareSkillsSetBusy()}
         shareSkillsSetUrl={shareSkillsSetUrl()}
         shareSkillsSetError={shareSkillsSetError()}

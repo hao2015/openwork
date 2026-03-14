@@ -50,6 +50,38 @@ export type OpenworkServerDiagnostics = {
   tokenSource: { client: string; host: string };
 };
 
+export type OpenworkRuntimeServiceName = "openwork-server" | "opencode" | "opencode-router";
+
+export type OpenworkRuntimeServiceSnapshot = {
+  name: OpenworkRuntimeServiceName;
+  enabled: boolean;
+  running: boolean;
+  targetVersion: string | null;
+  actualVersion: string | null;
+  upgradeAvailable: boolean;
+};
+
+export type OpenworkRuntimeSnapshot = {
+  ok: boolean;
+  orchestrator?: {
+    version: string;
+    startedAt: number;
+  };
+  worker?: {
+    workspace: string;
+    sandboxMode: string;
+  };
+  upgrade?: {
+    status: "idle" | "running" | "failed";
+    startedAt: number | null;
+    finishedAt: number | null;
+    error: string | null;
+    operationId: string | null;
+    services: OpenworkRuntimeServiceName[];
+  };
+  services: OpenworkRuntimeServiceSnapshot[];
+};
+
 export type OpenworkServerSettings = {
   urlOverride?: string;
   portOverride?: number;
@@ -120,6 +152,86 @@ export type OpenworkWorkspaceFileWriteResult = {
   path: string;
   bytes: number;
   updatedAt: number;
+  revision?: string;
+};
+
+export type OpenworkFileSession = {
+  id: string;
+  workspaceId: string;
+  createdAt: number;
+  expiresAt: number;
+  ttlMs: number;
+  canWrite: boolean;
+};
+
+export type OpenworkFileCatalogEntry = {
+  path: string;
+  kind: "file" | "dir";
+  size: number;
+  mtimeMs: number;
+  revision: string;
+};
+
+export type OpenworkFileSessionEvent = {
+  id: string;
+  seq: number;
+  workspaceId: string;
+  type: "write" | "delete" | "rename" | "mkdir";
+  path: string;
+  toPath?: string;
+  revision?: string;
+  timestamp: number;
+};
+
+export type OpenworkFileReadBatchResult = {
+  items: Array<
+    | {
+        ok: true;
+        path: string;
+        kind: "file";
+        bytes: number;
+        updatedAt: number;
+        revision: string;
+        contentBase64: string;
+      }
+    | {
+        ok: false;
+        path: string;
+        code: string;
+        message: string;
+        maxBytes?: number;
+        size?: number;
+      }
+  >;
+};
+
+export type OpenworkFileWriteBatchResult = {
+  items: Array<
+    | {
+        ok: true;
+        path: string;
+        bytes: number;
+        updatedAt: number;
+        revision: string;
+        previousRevision?: string | null;
+      }
+    | {
+        ok: false;
+        path: string;
+        code: string;
+        message: string;
+        expectedRevision?: string;
+        currentRevision?: string | null;
+        maxBytes?: number;
+        size?: number;
+      }
+  >;
+  cursor: number;
+};
+
+export type OpenworkFileOpsBatchResult = {
+  items: Array<Record<string, unknown>>;
+  cursor: number;
 };
 
 export type OpenworkCommandItem = {
@@ -368,40 +480,6 @@ export type OpenworkInboxUploadResult = {
   ok: boolean;
   path: string;
   bytes: number;
-};
-
-export type OpenworkSoulHeartbeatEntry = {
-  id: string;
-  ts: string | null;
-  workspace: string | null;
-  summary: string;
-  looseEnds: string[];
-  nextAction: string | null;
-};
-
-export type OpenworkSoulStatus = {
-  enabled: boolean;
-  state: "off" | "healthy" | "stale" | "error";
-  memoryEnabled: boolean;
-  instructionsEnabled: boolean;
-  heartbeatLogExists: boolean;
-  heartbeatCommandExists: boolean;
-  heartbeatJob: {
-    name: string;
-    slug: string;
-    schedule: string;
-    lastRunAt: string | null;
-    lastRunStatus: string | null;
-    lastRunError: string | null;
-  } | null;
-  heartbeatCount: number;
-  lastHeartbeatAt: string | null;
-  lastHeartbeatSummary: string | null;
-  staleAfterMs: number | null;
-  overdue: boolean;
-  summary: string;
-  memoryPath: string;
-  heartbeatPath: string;
 };
 
 type RawJsonResponse<T> = {
@@ -1093,6 +1171,8 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
     token,
     health: () =>
       requestJson<{ ok: boolean; version: string; uptimeMs: number }>(baseUrl, "/health", { token, hostToken, timeoutMs: timeouts.health }),
+    runtimeVersions: () =>
+      requestJson<OpenworkRuntimeSnapshot>(baseUrl, "/runtime/versions", { token, hostToken, timeoutMs: timeouts.status }),
     status: () => requestJson<OpenworkServerDiagnostics>(baseUrl, "/status", { token, hostToken, timeoutMs: timeouts.status }),
     capabilities: () => requestJson<OpenworkServerCapabilities>(baseUrl, "/capabilities", { token, hostToken, timeoutMs: timeouts.capabilities }),
     opencodeRouterHealth: () =>
@@ -1509,17 +1589,6 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
           method: "DELETE",
         },
       ),
-    getSoulStatus: (workspaceId: string) =>
-      requestJson<OpenworkSoulStatus>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/soul/status`, {
-        token,
-        hostToken,
-      }),
-    listSoulHeartbeats: (workspaceId: string, limit = 20) =>
-      requestJson<{ items: OpenworkSoulHeartbeatEntry[]; total: number; path: string }>(
-        baseUrl,
-        `/workspace/${encodeURIComponent(workspaceId)}/soul/heartbeats?limit=${encodeURIComponent(String(limit))}`,
-        { token, hostToken },
-      ),
 
     uploadInbox: async (workspaceId: string, file: File, options?: { path?: string }) => {
       const id = workspaceId.trim();
@@ -1587,6 +1656,103 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         `/workspace/${encodeURIComponent(workspaceId)}/inbox/${encodeURIComponent(inboxId)}`,
         { token, hostToken, timeoutMs: timeouts.binary },
       ),
+
+    createFileSession: (workspaceId: string, options?: { ttlSeconds?: number; write?: boolean }) =>
+      requestJson<{ session: OpenworkFileSession }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/files/sessions`, {
+        token,
+        hostToken,
+        method: "POST",
+        body: {
+          ...(typeof options?.ttlSeconds === "number" ? { ttlSeconds: options.ttlSeconds } : {}),
+          ...(typeof options?.write === "boolean" ? { write: options.write } : {}),
+        },
+      }),
+
+    renewFileSession: (sessionId: string, options?: { ttlSeconds?: number }) =>
+      requestJson<{ session: OpenworkFileSession }>(baseUrl, `/files/sessions/${encodeURIComponent(sessionId)}/renew`, {
+        token,
+        hostToken,
+        method: "POST",
+        body: {
+          ...(typeof options?.ttlSeconds === "number" ? { ttlSeconds: options.ttlSeconds } : {}),
+        },
+      }),
+
+    closeFileSession: (sessionId: string) =>
+      requestJson<{ ok: boolean }>(baseUrl, `/files/sessions/${encodeURIComponent(sessionId)}`, {
+        token,
+        hostToken,
+        method: "DELETE",
+      }),
+
+    getFileCatalogSnapshot: (
+      sessionId: string,
+      options?: { prefix?: string; after?: string; includeDirs?: boolean; limit?: number },
+    ) => {
+      const params = new URLSearchParams();
+      if (options?.prefix?.trim()) params.set("prefix", options.prefix.trim());
+      if (options?.after?.trim()) params.set("after", options.after.trim());
+      if (typeof options?.includeDirs === "boolean") params.set("includeDirs", options.includeDirs ? "true" : "false");
+      if (typeof options?.limit === "number") params.set("limit", String(options.limit));
+      const query = params.toString();
+      return requestJson<{
+        sessionId: string;
+        workspaceId: string;
+        generatedAt: number;
+        cursor: number;
+        total: number;
+        truncated: boolean;
+        nextAfter?: string;
+        items: OpenworkFileCatalogEntry[];
+      }>(
+        baseUrl,
+        `/files/sessions/${encodeURIComponent(sessionId)}/catalog/snapshot${query ? `?${query}` : ""}`,
+        { token, hostToken },
+      );
+    },
+
+    listFileSessionEvents: (sessionId: string, options?: { since?: number }) => {
+      const query = typeof options?.since === "number" ? `?since=${encodeURIComponent(String(options.since))}` : "";
+      return requestJson<{ items: OpenworkFileSessionEvent[]; cursor: number }>(
+        baseUrl,
+        `/files/sessions/${encodeURIComponent(sessionId)}/catalog/events${query}`,
+        { token, hostToken },
+      );
+    },
+
+    readFileBatch: (sessionId: string, paths: string[]) =>
+      requestJson<OpenworkFileReadBatchResult>(baseUrl, `/files/sessions/${encodeURIComponent(sessionId)}/read-batch`, {
+        token,
+        hostToken,
+        method: "POST",
+        body: { paths },
+      }),
+
+    writeFileBatch: (
+      sessionId: string,
+      writes: Array<{ path: string; contentBase64: string; ifMatchRevision?: string; force?: boolean }>,
+    ) =>
+      requestJson<OpenworkFileWriteBatchResult>(baseUrl, `/files/sessions/${encodeURIComponent(sessionId)}/write-batch`, {
+        token,
+        hostToken,
+        method: "POST",
+        body: { writes },
+      }),
+
+    runFileBatchOps: (
+      sessionId: string,
+      operations: Array<
+        | { type: "mkdir"; path: string }
+        | { type: "delete"; path: string; recursive?: boolean }
+        | { type: "rename"; from: string; to: string }
+      >,
+    ) =>
+      requestJson<OpenworkFileOpsBatchResult>(baseUrl, `/files/sessions/${encodeURIComponent(sessionId)}/ops`, {
+        token,
+        hostToken,
+        method: "POST",
+        body: { operations },
+      }),
 
     readWorkspaceFile: (workspaceId: string, path: string) =>
       requestJson<OpenworkWorkspaceFileContent>(

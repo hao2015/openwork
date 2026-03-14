@@ -4,8 +4,53 @@ import { FormEvent, useEffect, useState } from "react";
 
 type Step = 1 | 2;
 type AuthMode = "sign-in" | "sign-up";
+type SocialAuthProvider = "github" | "google";
 type ShellView = "workers" | "billing";
 type WorkerStatusBucket = "ready" | "starting" | "attention" | "other";
+
+type BillingPrice = {
+  amount: number | null;
+  currency: string | null;
+  recurringInterval: string | null;
+  recurringIntervalCount: number | null;
+};
+
+type BillingSubscription = {
+  id: string;
+  status: string;
+  amount: number | null;
+  currency: string | null;
+  recurringInterval: string | null;
+  recurringIntervalCount: number | null;
+  currentPeriodStart: string | null;
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+  canceledAt: string | null;
+  endedAt: string | null;
+};
+
+type BillingInvoice = {
+  id: string;
+  createdAt: string | null;
+  status: string;
+  totalAmount: number | null;
+  currency: string | null;
+  invoiceNumber: string | null;
+  invoiceUrl: string | null;
+};
+
+type BillingSummary = {
+  featureGateEnabled: boolean;
+  hasActivePlan: boolean;
+  checkoutRequired: boolean;
+  checkoutUrl: string | null;
+  portalUrl: string | null;
+  price: BillingPrice | null;
+  subscription: BillingSubscription | null;
+  invoices: BillingInvoice[];
+  productId: string | null;
+  benefitId: string | null;
+};
 
 type AuthUser = {
   id: string;
@@ -51,6 +96,27 @@ type WorkerListItem = {
   createdAt: string | null;
 };
 
+type RuntimeServiceName = "openwork-server" | "opencode" | "opencode-router";
+
+type WorkerRuntimeService = {
+  name: RuntimeServiceName;
+  enabled: boolean;
+  running: boolean;
+  targetVersion: string | null;
+  actualVersion: string | null;
+  upgradeAvailable: boolean;
+};
+
+type WorkerRuntimeSnapshot = {
+  services: WorkerRuntimeService[];
+  upgrade: {
+    status: "idle" | "running" | "failed";
+    startedAt: string | null;
+    finishedAt: string | null;
+    error: string | null;
+  };
+};
+
 type EventLevel = "info" | "success" | "warning" | "error";
 
 type LaunchEvent = {
@@ -71,7 +137,7 @@ type DenSignupTrackPayload = {
   email: string;
   name: string | null;
   userId: string;
-  authMethod: "email" | "github";
+  authMethod: "email" | SocialAuthProvider;
 };
 
 declare global {
@@ -87,11 +153,13 @@ function getAuthInfoForMode(mode: AuthMode): string {
 }
 
 const LAST_WORKER_STORAGE_KEY = "openwork:web:last-worker";
-const PENDING_GITHUB_SIGNUP_STORAGE_KEY = "openwork:web:pending-github-signup";
+const PENDING_SOCIAL_SIGNUP_STORAGE_KEY = "openwork:web:pending-social-signup";
+const AUTH_TOKEN_STORAGE_KEY = "openwork:web:auth-token";
 const WORKER_STATUS_POLL_MS = 5000;
 const DEFAULT_AUTH_NAME = "OpenWork User";
 const OPENWORK_APP_CONNECT_BASE_URL = (process.env.NEXT_PUBLIC_OPENWORK_APP_CONNECT_URL ?? "").trim();
-const OPENWORK_AUTH_CALLBACK_BASE_URL = (process.env.NEXT_PUBLIC_OPENWORK_AUTH_CALLBACK_URL ?? "https://app.openwork.software").trim();
+const OPENWORK_AUTH_CALLBACK_BASE_URL = (process.env.NEXT_PUBLIC_OPENWORK_AUTH_CALLBACK_URL ?? "").trim();
+const BILLING_DISABLED_FOR_EXPERIMENT = true;
 
 function getEmailDomain(email: string): string {
   const atIndex = email.lastIndexOf("@");
@@ -159,12 +227,79 @@ async function trackDenSignupInLoops(payload: DenSignupTrackPayload) {
   }
 }
 
-function getGithubCallbackUrl(): string {
+function getSocialCallbackUrl(): string {
   try {
-    return new URL("/", OPENWORK_AUTH_CALLBACK_BASE_URL || "https://app.openwork.software").toString();
+    const origin = typeof window !== "undefined"
+      ? window.location.origin
+      : OPENWORK_AUTH_CALLBACK_BASE_URL || "https://app.openwork.software";
+    return new URL("/", origin).toString();
   } catch {
     return "https://app.openwork.software/";
   }
+}
+
+function getSocialProviderLabel(provider: SocialAuthProvider): string {
+  return provider === "github" ? "GitHub" : "Google";
+}
+
+function getExperimentBillingSummary(): BillingSummary {
+  return {
+    featureGateEnabled: false,
+    hasActivePlan: false,
+    checkoutRequired: false,
+    checkoutUrl: null,
+    portalUrl: null,
+    price: null,
+    subscription: null,
+    invoices: [],
+    productId: null,
+    benefitId: null
+  };
+}
+
+function getAdditionalWorkerRequestHref(): string {
+  const subject = "requesting an additional worker";
+  const body = [
+    "Hey Ben,",
+    "",
+    "I would like to create an additional worker in order to {INSERT REASON}"
+  ].join("\n");
+
+  return `mailto:ben@openwork.software?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+
+function GitHubLogo() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true" className="ow-social-icon">
+      <path
+        fill="currentColor"
+        d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.5-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.5 7.5 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+      />
+    </svg>
+  );
+}
+
+function GoogleLogo() {
+  return (
+    <svg viewBox="0 0 18 18" aria-hidden="true" className="ow-social-icon">
+      <path
+        fill="#4285F4"
+        d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.92c1.71-1.57 2.68-3.89 2.68-6.62Z"
+      />
+      <path
+        fill="#34A853"
+        d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.81.54-1.84.86-3.04.86-2.34 0-4.31-1.58-5.01-3.7H.96v2.33A9 9 0 0 0 9 18Z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M3.99 10.72A5.41 5.41 0 0 1 3.71 9c0-.6.1-1.18.28-1.72V4.95H.96A9 9 0 0 0 0 9c0 1.45.35 2.82.96 4.05l3.03-2.33Z"
+      />
+      <path
+        fill="#EA4335"
+        d="M9 3.58c1.32 0 2.5.45 3.43 1.33l2.57-2.57C13.46.9 11.43 0 9 0A9 9 0 0 0 .96 4.95l3.03 2.33c.7-2.12 2.67-3.7 5.01-3.7Z"
+      />
+    </svg>
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -176,6 +311,68 @@ function shortValue(value: string): string {
     return value;
   }
   return `${value.slice(0, 8)}...${value.slice(-6)}`;
+}
+
+function formatMoneyMinor(amount: number | null, currency: string | null): string {
+  if (typeof amount !== "number" || !Number.isFinite(amount)) {
+    return "Not available";
+  }
+
+  const normalizedCurrency = (currency ?? "USD").toUpperCase();
+  const majorValue = amount / 100;
+
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: normalizedCurrency
+    }).format(majorValue);
+  } catch {
+    return `${majorValue.toFixed(2)} ${normalizedCurrency}`;
+  }
+}
+
+function formatIsoDate(value: string | null): string {
+  if (!value) {
+    return "Not available";
+  }
+
+  try {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return "Not available";
+    }
+    return date.toLocaleDateString();
+  } catch {
+    return "Not available";
+  }
+}
+
+function formatRecurringInterval(interval: string | null, count: number | null): string {
+  if (!interval) {
+    return "billing cycle";
+  }
+
+  const normalizedInterval = interval.replace(/_/g, " ");
+  const normalizedCount = typeof count === "number" && Number.isFinite(count) ? count : 1;
+
+  if (normalizedCount <= 1) {
+    return `per ${normalizedInterval}`;
+  }
+
+  const pluralSuffix = normalizedInterval.endsWith("s") ? "" : "s";
+  return `every ${normalizedCount} ${normalizedInterval}${pluralSuffix}`;
+}
+
+function formatSubscriptionStatus(status: string): string {
+  const normalized = status.trim().toLowerCase();
+  if (!normalized) {
+    return "Unknown";
+  }
+
+  return normalized
+    .split("_")
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
 }
 
 function getErrorMessage(payload: unknown, fallback: string): string {
@@ -306,6 +503,140 @@ function getWorkerTokens(payload: unknown): WorkerTokens | null {
   return { clientToken, hostToken, openworkUrl, workspaceId };
 }
 
+function getWorkerRuntimeSnapshot(payload: unknown): WorkerRuntimeSnapshot | null {
+  if (!isRecord(payload) || !Array.isArray(payload.services)) {
+    return null;
+  }
+
+  const services = payload.services
+    .map((value) => {
+      if (!isRecord(value) || typeof value.name !== "string") {
+        return null;
+      }
+
+      return {
+        name: value.name as RuntimeServiceName,
+        enabled: value.enabled === true,
+        running: value.running === true,
+        targetVersion: typeof value.targetVersion === "string" ? value.targetVersion : null,
+        actualVersion: typeof value.actualVersion === "string" ? value.actualVersion : null,
+        upgradeAvailable: value.upgradeAvailable === true
+      };
+    })
+    .filter((item): item is WorkerRuntimeService => item !== null);
+
+  const upgrade = isRecord(payload.upgrade) ? payload.upgrade : null;
+
+  return {
+    services,
+    upgrade: {
+      status:
+        upgrade?.status === "running" || upgrade?.status === "failed" || upgrade?.status === "idle"
+          ? upgrade.status
+          : "idle",
+      startedAt: typeof upgrade?.startedAt === "number" ? new Date(upgrade.startedAt).toISOString() : null,
+      finishedAt: typeof upgrade?.finishedAt === "number" ? new Date(upgrade.finishedAt).toISOString() : null,
+      error: typeof upgrade?.error === "string" ? upgrade.error : null
+    }
+  };
+}
+
+function getRuntimeServiceLabel(name: RuntimeServiceName): string {
+  switch (name) {
+    case "openwork-server":
+      return "OpenWork server";
+    case "opencode":
+      return "OpenCode";
+    case "opencode-router":
+      return "OpenCode Router";
+  }
+}
+
+function getBillingPrice(value: unknown): BillingPrice | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  return {
+    amount: typeof value.amount === "number" ? value.amount : null,
+    currency: typeof value.currency === "string" ? value.currency : null,
+    recurringInterval: typeof value.recurringInterval === "string" ? value.recurringInterval : null,
+    recurringIntervalCount: typeof value.recurringIntervalCount === "number" ? value.recurringIntervalCount : null
+  };
+}
+
+function getBillingSubscription(value: unknown): BillingSubscription | null {
+  if (!isRecord(value) || typeof value.id !== "string") {
+    return null;
+  }
+
+  return {
+    id: value.id,
+    status: typeof value.status === "string" ? value.status : "unknown",
+    amount: typeof value.amount === "number" ? value.amount : null,
+    currency: typeof value.currency === "string" ? value.currency : null,
+    recurringInterval: typeof value.recurringInterval === "string" ? value.recurringInterval : null,
+    recurringIntervalCount: typeof value.recurringIntervalCount === "number" ? value.recurringIntervalCount : null,
+    currentPeriodStart: typeof value.currentPeriodStart === "string" ? value.currentPeriodStart : null,
+    currentPeriodEnd: typeof value.currentPeriodEnd === "string" ? value.currentPeriodEnd : null,
+    cancelAtPeriodEnd: value.cancelAtPeriodEnd === true,
+    canceledAt: typeof value.canceledAt === "string" ? value.canceledAt : null,
+    endedAt: typeof value.endedAt === "string" ? value.endedAt : null
+  };
+}
+
+function getBillingInvoice(value: unknown): BillingInvoice | null {
+  if (!isRecord(value) || typeof value.id !== "string") {
+    return null;
+  }
+
+  return {
+    id: value.id,
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : null,
+    status: typeof value.status === "string" ? value.status : "unknown",
+    totalAmount: typeof value.totalAmount === "number" ? value.totalAmount : null,
+    currency: typeof value.currency === "string" ? value.currency : null,
+    invoiceNumber: typeof value.invoiceNumber === "string" ? value.invoiceNumber : null,
+    invoiceUrl: typeof value.invoiceUrl === "string" ? value.invoiceUrl : null
+  };
+}
+
+function getBillingSummary(payload: unknown): BillingSummary | null {
+  if (!isRecord(payload) || !isRecord(payload.billing)) {
+    return null;
+  }
+
+  const billing = payload.billing;
+  const featureGateEnabled = billing.featureGateEnabled;
+  const hasActivePlan = billing.hasActivePlan;
+  const checkoutRequired = billing.checkoutRequired;
+
+  if (
+    typeof featureGateEnabled !== "boolean" ||
+    typeof hasActivePlan !== "boolean" ||
+    typeof checkoutRequired !== "boolean"
+  ) {
+    return null;
+  }
+
+  return {
+    featureGateEnabled,
+    hasActivePlan,
+    checkoutRequired,
+    checkoutUrl: typeof billing.checkoutUrl === "string" ? billing.checkoutUrl : null,
+    portalUrl: typeof billing.portalUrl === "string" ? billing.portalUrl : null,
+    price: getBillingPrice(billing.price),
+    subscription: getBillingSubscription(billing.subscription),
+    invoices: Array.isArray(billing.invoices)
+      ? billing.invoices
+          .map((item) => getBillingInvoice(item))
+          .filter((item): item is BillingInvoice => item !== null)
+      : [],
+    productId: typeof billing.productId === "string" ? billing.productId : null,
+    benefitId: typeof billing.benefitId === "string" ? billing.benefitId : null
+  };
+}
+
 function parseWorkerListItem(value: unknown): WorkerListItem | null {
   if (!isRecord(value)) {
     return null;
@@ -381,18 +712,6 @@ function getWorkerStatusCopy(status: string): string {
       return "Worker is suspended.";
     default:
       return "Worker status unknown.";
-  }
-}
-
-function getWorkerAddressLabel(item: WorkerListItem): string {
-  if (!item.instanceUrl) {
-    return shortValue(item.workerId);
-  }
-
-  try {
-    return new URL(item.instanceUrl).host;
-  } catch {
-    return shortValue(item.instanceUrl);
   }
 }
 
@@ -647,7 +966,8 @@ async function requestJson(path: string, init: RequestInit = {}, timeoutMs = 300
 
   let response: Response;
   try {
-    response = await fetch(`/api/den${path}`, {
+    const endpoint = path.startsWith("/api/") ? path : `/api/den${path}`;
+    response = await fetch(endpoint, {
       ...init,
       headers,
       credentials: "include",
@@ -722,7 +1042,18 @@ export function CloudControlPanel() {
   const [authInfo, setAuthInfo] = useState(getAuthInfoForMode("sign-up"));
   const [authError, setAuthError] = useState<string | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
-  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(() => {
+    if (typeof window === "undefined") {
+      return null;
+    }
+
+    const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    if (!token || token.trim().length === 0) {
+      return null;
+    }
+
+    return token;
+  });
 
   const [workerName, setWorkerName] = useState("Founder Ops Pilot");
   const [worker, setWorker] = useState<WorkerLaunch | null>(null);
@@ -735,17 +1066,29 @@ export function CloudControlPanel() {
   const [launchStatus, setLaunchStatus] = useState("Name your worker and click launch.");
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [checkoutUrl, setCheckoutUrl] = useState<string | null>(null);
+  const [billingSummary, setBillingSummary] = useState<BillingSummary | null>(null);
+  const [billingBusy, setBillingBusy] = useState(false);
+  const [billingCheckoutBusy, setBillingCheckoutBusy] = useState(false);
+  const [billingSubscriptionBusy, setBillingSubscriptionBusy] = useState(false);
+  const [billingError, setBillingError] = useState<string | null>(null);
   const [paymentReturned, setPaymentReturned] = useState(false);
 
   const [events, setEvents] = useState<LaunchEvent[]>([]);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [tokenFetchedForWorkerId, setTokenFetchedForWorkerId] = useState<string | null>(null);
   const [deleteBusyWorkerId, setDeleteBusyWorkerId] = useState<string | null>(null);
+  const [redeployBusyWorkerId, setRedeployBusyWorkerId] = useState<string | null>(null);
   const [workerQuery, setWorkerQuery] = useState("");
   const [workerStatusFilter, setWorkerStatusFilter] = useState<WorkerStatusBucket | "all">("all");
   const [showLaunchForm, setShowLaunchForm] = useState(false);
+  const [mobileWorkersExpanded, setMobileWorkersExpanded] = useState(false);
+  const [pendingRestoredWorkerId, setPendingRestoredWorkerId] = useState<string | null>(null);
   const [openAccordion, setOpenAccordion] = useState<"connect" | "actions" | "advanced" | null>(null);
   const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
+  const [runtimeSnapshot, setRuntimeSnapshot] = useState<WorkerRuntimeSnapshot | null>(null);
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [runtimeUpgradeBusy, setRuntimeUpgradeBusy] = useState(false);
 
   const selectedWorker = workers.find((item) => item.workerId === workerLookupId) ?? null;
   const activeWorker: WorkerLaunch | null =
@@ -757,8 +1100,12 @@ export function CloudControlPanel() {
 
   const progressWidth = step === 1 ? "45%" : "100%";
   const isShellStep = step === 2;
+  const defaultAuthInfo = getAuthInfoForMode(authMode);
+  const showAuthFeedback = authInfo !== defaultAuthInfo || authError !== null;
   const openworkConnectUrl = activeWorker?.openworkUrl ?? activeWorker?.instanceUrl ?? null;
   const hasWorkspaceScopedUrl = Boolean(openworkConnectUrl && /\/w\/[^/?#]+/.test(openworkConnectUrl));
+  const ownedWorkerCount = workers.filter((item) => item.isMine).length;
+  const workerLimitReached = Boolean(user && ownedWorkerCount > 0);
   const openworkDeepLink = buildOpenworkDeepLink(
     openworkConnectUrl,
     activeWorker?.clientToken ?? null,
@@ -791,8 +1138,79 @@ export function CloudControlPanel() {
     return getWorkerStatusMeta(item.status).bucket === workerStatusFilter;
   });
 
+  const selectWorker = (item: WorkerListItem, options: { collapseMobile?: boolean } = {}) => {
+    setWorkerLookupId(item.workerId);
+    setWorker((current) => listItemToWorker(item, current));
+    if (options.collapseMobile) {
+      setMobileWorkersExpanded(false);
+      setShowLaunchForm(false);
+    }
+  };
+
+  const mobilePreviewWorker = selectedWorker ?? filteredWorkers[0] ?? null;
+
+  const renderWorkerRow = (
+    item: WorkerListItem,
+    options: { collapseMobile?: boolean; dense?: boolean } = {}
+  ) => {
+    const meta = getWorkerStatusMeta(item.status);
+    const isActive = workerLookupId === item.workerId;
+    const statusPill =
+      meta.bucket === "ready"
+        ? "bg-[#E8F5E9] text-[#2E7D32]"
+        : meta.bucket === "starting"
+          ? "bg-amber-100 text-amber-700"
+          : meta.bucket === "attention"
+            ? "bg-rose-100 text-rose-700"
+            : "bg-slate-100 text-slate-500";
+
+    const statusDot =
+      meta.bucket === "ready"
+        ? "bg-[#2E7D32]"
+        : meta.bucket === "starting"
+          ? "bg-amber-500"
+          : meta.bucket === "attention"
+            ? "bg-rose-500"
+            : "bg-slate-400";
+
+    return (
+      <button
+        key={item.workerId}
+        type="button"
+        onClick={() => selectWorker(item, { collapseMobile: options.collapseMobile })}
+        className={`w-full rounded-[20px] border ${options.dense ? "p-3" : "p-4"} text-left transition-all ${
+          isActive
+            ? "border-[#1B29FF] bg-[#1B29FF]/[0.03] ring-1 ring-[#1B29FF]/30"
+            : "border-slate-100 bg-white hover:border-slate-300"
+        }`}
+      >
+        <div className="mb-1 flex items-center justify-between gap-2">
+          <span className={`truncate pr-2 text-sm font-semibold ${isActive ? "text-[#1B29FF]" : "text-slate-700"}`}>
+            {item.workerName}
+          </span>
+          {item.isMine ? (
+            <span className="shrink-0 rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+              Yours
+            </span>
+          ) : null}
+        </div>
+        <div className="mt-3 flex items-center justify-end">
+          <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${statusPill}`}>
+            <span className={`h-1.5 w-1.5 rounded-full ${statusDot}`} />
+            {meta.label}
+          </span>
+        </div>
+      </button>
+    );
+  };
+
   const selectedWorkerStatus = activeWorker?.status ?? selectedWorker?.status ?? "unknown";
   const selectedStatusMeta = getWorkerStatusMeta(selectedWorkerStatus);
+  const isSelectedWorkerFailed = selectedWorkerStatus.trim().toLowerCase() === "failed";
+  const effectiveCheckoutUrl = BILLING_DISABLED_FOR_EXPERIMENT ? null : (checkoutUrl ?? billingSummary?.checkoutUrl ?? null);
+  const billingSubscription = billingSummary?.subscription ?? null;
+  const billingPrice = billingSummary?.price ?? null;
+  const runtimeUpgradeCount = runtimeSnapshot?.services.filter((item) => item.upgradeAvailable).length ?? 0;
 
   function appendEvent(level: EventLevel, label: string, detail: string) {
     setEvents((current) => {
@@ -888,6 +1306,9 @@ export function CloudControlPanel() {
       const nextWorkers = getWorkersList(payload);
       setWorkers(nextWorkers);
 
+      const restoredWorkerStillExists =
+        pendingRestoredWorkerId && nextWorkers.some((item) => item.workerId === pendingRestoredWorkerId);
+
       const currentSelection = options.keepSelection ? workerLookupId : "";
       const nextSelectedId =
         currentSelection && nextWorkers.some((item) => item.workerId === currentSelection)
@@ -895,6 +1316,21 @@ export function CloudControlPanel() {
           : nextWorkers[0]?.workerId ?? "";
 
       setWorkerLookupId(nextSelectedId);
+
+      if (!nextSelectedId) {
+        setWorker(null);
+        setTokenFetchedForWorkerId(null);
+        setPendingRestoredWorkerId(null);
+        setLaunchStatus("Name your worker and click launch.");
+        if (typeof window !== "undefined") {
+          window.localStorage.removeItem(LAST_WORKER_STORAGE_KEY);
+        }
+        return;
+      }
+
+      if (restoredWorkerStillExists) {
+        setPendingRestoredWorkerId(null);
+      }
 
       if (nextSelectedId && worker && worker.workerId === nextSelectedId) {
         const selected = nextWorkers.find((item) => item.workerId === nextSelectedId) ?? null;
@@ -907,6 +1343,245 @@ export function CloudControlPanel() {
       setWorkersError(message);
     } finally {
       setWorkersBusy(false);
+    }
+  }
+
+  async function refreshRuntime(workerId?: string, options: { quiet?: boolean } = {}) {
+    const targetWorkerId = workerId ?? activeWorker?.workerId ?? selectedWorker?.workerId ?? null;
+    if (!user || !targetWorkerId) {
+      setRuntimeSnapshot(null);
+      if (!options.quiet) {
+        setRuntimeError("Select a worker to inspect runtime versions.");
+      }
+      return null;
+    }
+
+    setRuntimeBusy(true);
+    if (!options.quiet) {
+      setRuntimeError(null);
+    }
+
+    try {
+      const { response, payload } = await requestJson(`/v1/workers/${encodeURIComponent(targetWorkerId)}/runtime`, {
+        method: "GET",
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
+      }, 12000);
+
+      if (!response.ok) {
+        const message = getErrorMessage(payload, `Runtime check failed with ${response.status}.`);
+        if (!options.quiet) {
+          setRuntimeError(message);
+        }
+        return null;
+      }
+
+      const snapshot = getWorkerRuntimeSnapshot(payload);
+      if (!snapshot) {
+        if (!options.quiet) {
+          setRuntimeError("Runtime details were missing from the worker response.");
+        }
+        return null;
+      }
+
+      setRuntimeSnapshot(snapshot);
+      return snapshot;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown network error";
+      if (!options.quiet) {
+        setRuntimeError(message);
+      }
+      return null;
+    } finally {
+      setRuntimeBusy(false);
+    }
+  }
+
+  async function handleRuntimeUpgrade() {
+    const targetWorkerId = activeWorker?.workerId ?? selectedWorker?.workerId ?? null;
+    if (!user || !targetWorkerId || runtimeUpgradeBusy) {
+      return;
+    }
+
+    setRuntimeUpgradeBusy(true);
+    setRuntimeError(null);
+
+    try {
+      const { response, payload } = await requestJson(`/v1/workers/${encodeURIComponent(targetWorkerId)}/runtime/upgrade`, {
+        method: "POST",
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+        body: JSON.stringify({ services: ["openwork-server", "opencode"] })
+      }, 12000);
+
+      if (!response.ok) {
+        const message = getErrorMessage(payload, `Runtime upgrade failed with ${response.status}.`);
+        setRuntimeError(message);
+        appendEvent("error", "Runtime upgrade failed", message);
+        return;
+      }
+
+      appendEvent("info", "Runtime upgrade started", activeWorker?.workerName ?? selectedWorker?.workerName ?? targetWorkerId);
+      setRuntimeSnapshot((current) => current
+        ? {
+            ...current,
+            upgrade: {
+              ...current.upgrade,
+              status: "running",
+              startedAt: new Date().toISOString(),
+              finishedAt: null,
+              error: null
+            }
+          }
+        : current);
+
+      window.setTimeout(() => {
+        void refreshRuntime(targetWorkerId, { quiet: true });
+      }, 4000);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown network error";
+      setRuntimeError(message);
+      appendEvent("error", "Runtime upgrade failed", message);
+    } finally {
+      setRuntimeUpgradeBusy(false);
+    }
+  }
+
+  async function refreshBilling(options: { includeCheckout?: boolean; quiet?: boolean } = {}) {
+    if (BILLING_DISABLED_FOR_EXPERIMENT) {
+      const summary = getExperimentBillingSummary();
+      setBillingSummary(summary);
+      setCheckoutUrl(null);
+      setBillingError(null);
+      return summary;
+    }
+
+    if (!user) {
+      setBillingSummary(null);
+      if (!options.quiet) {
+        setBillingError("Sign in to view billing details.");
+      }
+      return null;
+    }
+
+    const includeCheckout = options.includeCheckout === true;
+    const quiet = options.quiet === true;
+
+    if (includeCheckout) {
+      setBillingCheckoutBusy(true);
+    } else {
+      setBillingBusy(true);
+    }
+
+    if (!quiet) {
+      setBillingError(null);
+    }
+
+    try {
+      const query = includeCheckout ? "?includeCheckout=1" : "";
+      const { response, payload } = await requestJson(`/v1/workers/billing${query}`, {
+        method: "GET",
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
+      }, 12000);
+
+      if (!response.ok) {
+        const message = getErrorMessage(payload, `Billing lookup failed with ${response.status}.`);
+        if (!quiet) {
+          setBillingError(message);
+          appendEvent("error", "Billing check failed", message);
+        }
+        return null;
+      }
+
+      const summary = getBillingSummary(payload);
+      if (!summary) {
+        if (!quiet) {
+          setBillingError("Billing response was missing details.");
+          appendEvent("error", "Billing check failed", "Billing summary missing");
+        }
+        return null;
+      }
+
+      setBillingSummary(summary);
+      if (summary.checkoutUrl) {
+        setCheckoutUrl(summary.checkoutUrl);
+      } else if (!summary.checkoutRequired) {
+        setCheckoutUrl(null);
+      }
+
+      return summary;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown network error";
+      if (!quiet) {
+        setBillingError(message);
+        appendEvent("error", "Billing check failed", message);
+      }
+      return null;
+    } finally {
+      if (includeCheckout) {
+        setBillingCheckoutBusy(false);
+      } else {
+        setBillingBusy(false);
+      }
+    }
+  }
+
+  async function handleSubscriptionCancellation(cancelAtPeriodEnd: boolean) {
+    if (BILLING_DISABLED_FOR_EXPERIMENT) {
+      setBillingSummary(getExperimentBillingSummary());
+      setCheckoutUrl(null);
+      setBillingError("Billing is disabled for this experiment.");
+      return;
+    }
+
+    if (!user || billingSubscriptionBusy) {
+      return;
+    }
+
+    if (cancelAtPeriodEnd && typeof window !== "undefined") {
+      const confirmed = window.confirm("Cancel subscription at period end? You can still use your current billing period.");
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    setBillingSubscriptionBusy(true);
+    setBillingError(null);
+
+    try {
+      const { response, payload } = await requestJson("/v1/workers/billing/subscription", {
+        method: "POST",
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+        body: JSON.stringify({ cancelAtPeriodEnd })
+      }, 12000);
+
+      if (!response.ok) {
+        const message = getErrorMessage(payload, `Subscription update failed (${response.status}).`);
+        setBillingError(message);
+        appendEvent("error", "Subscription update failed", message);
+        return;
+      }
+
+      const summary = getBillingSummary(payload);
+      if (!summary) {
+        setBillingError("Subscription updated, but billing details could not be refreshed.");
+        appendEvent("warning", "Subscription updated", "Billing summary missing");
+        return;
+      }
+
+      setBillingSummary(summary);
+      if (summary.checkoutUrl) {
+        setCheckoutUrl(summary.checkoutUrl);
+      } else if (!summary.checkoutRequired) {
+        setCheckoutUrl(null);
+      }
+
+      const actionLabel = cancelAtPeriodEnd ? "Subscription will cancel at period end" : "Subscription auto-renew resumed";
+      appendEvent("success", actionLabel, user.email);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown network error";
+      setBillingError(message);
+      appendEvent("error", "Subscription update failed", message);
+    } finally {
+      setBillingSubscriptionBusy(false);
     }
   }
 
@@ -932,6 +1607,9 @@ export function CloudControlPanel() {
 
     if (!response.ok) {
       setUser(null);
+      if (response.status === 401 && authToken) {
+        setAuthToken(null);
+      }
       if (!quiet) {
         setAuthError("No active session found. Sign in first.");
       }
@@ -952,8 +1630,20 @@ export function CloudControlPanel() {
   }
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (authToken) {
+      window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
+    } else {
+      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+  }, [authToken]);
+
+  useEffect(() => {
     void refreshSession(true);
-  }, []);
+  }, [authToken]);
 
   useEffect(() => {
     if (!user) {
@@ -966,28 +1656,84 @@ export function CloudControlPanel() {
   }, [user?.id, authToken]);
 
   useEffect(() => {
+    const targetWorkerId = activeWorker?.workerId ?? selectedWorker?.workerId ?? null;
+    if (!user || !targetWorkerId || pendingRestoredWorkerId === targetWorkerId) {
+      setRuntimeSnapshot(null);
+      setRuntimeError(null);
+      return;
+    }
+
+    void refreshRuntime(targetWorkerId, { quiet: true });
+  }, [user?.id, authToken, activeWorker?.workerId, pendingRestoredWorkerId, selectedWorker?.workerId]);
+
+  useEffect(() => {
+    const targetWorkerId = activeWorker?.workerId ?? selectedWorker?.workerId ?? null;
+    if (!targetWorkerId || runtimeSnapshot?.upgrade.status !== "running") {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshRuntime(targetWorkerId, { quiet: true });
+    }, 5000);
+
+    return () => window.clearInterval(timer);
+  }, [activeWorker?.workerId, selectedWorker?.workerId, runtimeSnapshot?.upgrade.status]);
+
+  useEffect(() => {
+    if (BILLING_DISABLED_FOR_EXPERIMENT) {
+      setBillingSummary(getExperimentBillingSummary());
+      setBillingError(null);
+      setCheckoutUrl(null);
+      return;
+    }
+
+    if (!user) {
+      setBillingSummary(null);
+      setBillingError(null);
+      return;
+    }
+
+    void refreshBilling({ quiet: true });
+  }, [user?.id, authToken]);
+
+  useEffect(() => {
+    if (BILLING_DISABLED_FOR_EXPERIMENT) {
+      if (shellView !== "workers") {
+        setShellView("workers");
+      }
+      return;
+    }
+
+    if (!user || shellView !== "billing") {
+      return;
+    }
+
+    void refreshBilling();
+  }, [shellView, user?.id, authToken]);
+
+  useEffect(() => {
     if (!user || typeof window === "undefined") {
       return;
     }
 
     identifyPosthogUser(user);
 
-    const pendingSignup = window.sessionStorage.getItem(PENDING_GITHUB_SIGNUP_STORAGE_KEY);
-    if (!pendingSignup) {
+    const pendingSocialSignup = window.sessionStorage.getItem(PENDING_SOCIAL_SIGNUP_STORAGE_KEY);
+    if (pendingSocialSignup !== "github" && pendingSocialSignup !== "google") {
       return;
     }
 
-    window.sessionStorage.removeItem(PENDING_GITHUB_SIGNUP_STORAGE_KEY);
+    window.sessionStorage.removeItem(PENDING_SOCIAL_SIGNUP_STORAGE_KEY);
     trackPosthogEvent("den_signup_completed", {
       mode: "sign-up",
-      method: "github",
+      method: pendingSocialSignup,
       email_domain: getEmailDomain(user.email)
     });
     void trackDenSignupInLoops({
       email: user.email,
       name: user.name,
       userId: user.id,
-      authMethod: "github"
+      authMethod: pendingSocialSignup
     });
   }, [user?.id]);
 
@@ -1002,20 +1748,35 @@ export function CloudControlPanel() {
       return;
     }
 
-    setPaymentReturned(true);
+    // Polar checkout returns are ignored while billing is disabled for this experiment.
+    // TODO(den-free-first-worker): Re-enable the original Polar checkout return flow after the experiment.
+    // setPaymentReturned(true);
+    // setCheckoutUrl(null);
+    // setShellView("billing");
+    // setLaunchStatus("Checkout return detected. Click launch to continue worker provisioning.");
+    // setAuthInfo("Checkout return detected. Sign in to continue to Billing.");
+    // appendEvent("success", "Returned from checkout", `Session ${shortValue(customerSessionToken)}`);
+    // trackPosthogEvent("den_paywall_checkout_returned", {
+    //   source: "polar",
+    //   session_token_present: true
+    // });
     setCheckoutUrl(null);
-    setLaunchStatus("Checkout return detected. Click launch to continue worker provisioning.");
-    appendEvent("success", "Returned from checkout", `Session ${shortValue(customerSessionToken)}`);
-    trackPosthogEvent("den_paywall_checkout_returned", {
-      source: "polar",
-      session_token_present: true
-    });
+    setShellView("workers");
+    setLaunchStatus("Name your worker and click launch.");
 
     params.delete("customer_session_token");
     const nextQuery = params.toString();
     const nextUrl = nextQuery ? `${window.location.pathname}?${nextQuery}` : window.location.pathname;
     window.history.replaceState({}, "", nextUrl);
   }, []);
+
+  useEffect(() => {
+    if (!paymentReturned || !user) {
+      return;
+    }
+
+    // Billing refresh intentionally disabled for the one-worker experiment.
+  }, [paymentReturned, user?.id, authToken]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1043,6 +1804,7 @@ export function CloudControlPanel() {
 
       setWorker(restored);
       setWorkerLookupId(restored.workerId);
+      setPendingRestoredWorkerId(restored.workerId);
       setLaunchStatus(`Recovered worker ${restored.workerName}. ${getWorkerStatusCopy(restored.status)}`);
       appendEvent("info", "Recovered worker context", `Worker ID ${restored.workerId}`);
     } catch {
@@ -1065,26 +1827,32 @@ export function CloudControlPanel() {
   }, [worker]);
 
   useEffect(() => {
-    if (user || checkoutUrl || paymentReturned || worker) {
+    if (user || checkoutUrl) {
       setStep(2);
       return;
     }
 
     setStep(1);
-  }, [worker, user, checkoutUrl, paymentReturned]);
+  }, [user, checkoutUrl]);
 
   useEffect(() => {
     if (step !== 2) {
       return;
     }
 
-    if (workers.length === 0) {
-      setShowLaunchForm(true);
+    if (workers.length > 0) {
+      return;
     }
-  }, [step, workers.length]);
+
+    setMobileWorkersExpanded(false);
+    setShowLaunchForm(pendingRestoredWorkerId === null);
+  }, [pendingRestoredWorkerId, step, workers.length]);
 
   useEffect(() => {
     if (!user || !worker) {
+      return;
+    }
+    if (pendingRestoredWorkerId === worker.workerId) {
       return;
     }
     if (worker.clientToken) {
@@ -1099,10 +1867,13 @@ export function CloudControlPanel() {
 
     setTokenFetchedForWorkerId(worker.workerId);
     void handleGenerateKey();
-  }, [actionBusy, launchBusy, tokenFetchedForWorkerId, user, worker]);
+  }, [actionBusy, launchBusy, pendingRestoredWorkerId, tokenFetchedForWorkerId, user, worker]);
 
   useEffect(() => {
     if (!user || !worker || worker.status !== "provisioning") {
+      return;
+    }
+    if (pendingRestoredWorkerId === worker.workerId) {
       return;
     }
     if (actionBusy !== null || launchBusy) {
@@ -1127,7 +1898,7 @@ export function CloudControlPanel() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [actionBusy, authToken, launchBusy, user?.id, worker?.workerId, worker?.status]);
+  }, [actionBusy, authToken, launchBusy, pendingRestoredWorkerId, user?.id, worker?.workerId, worker?.status]);
 
   async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1227,44 +1998,44 @@ export function CloudControlPanel() {
     }
   }
 
-  async function handleGitHubSignIn() {
+  async function handleSocialSignIn(provider: SocialAuthProvider) {
     if (authBusy || typeof window === "undefined") {
       return;
     }
 
-    const shouldTrackGithubSignup = authMode === "sign-up";
-    if (shouldTrackGithubSignup) {
-      window.sessionStorage.setItem(PENDING_GITHUB_SIGNUP_STORAGE_KEY, "1");
+    const shouldTrackSocialSignup = authMode === "sign-up";
+    if (shouldTrackSocialSignup) {
+      window.sessionStorage.setItem(PENDING_SOCIAL_SIGNUP_STORAGE_KEY, provider);
     }
 
     setAuthBusy(true);
     setAuthError(null);
-    setAuthInfo("Redirecting to GitHub...");
+    setAuthInfo(`Redirecting to ${getSocialProviderLabel(provider)}...`);
     trackPosthogEvent("den_auth_submitted", {
       mode: authMode,
-      method: "github"
+      method: provider
     });
 
     try {
-      const callbackURL = getGithubCallbackUrl();
+      const callbackURL = getSocialCallbackUrl();
       const { response, payload } = await requestJson("/api/auth/sign-in/social", {
         method: "POST",
         body: JSON.stringify({
-          provider: "github",
+          provider,
           callbackURL,
           errorCallbackURL: callbackURL
         })
       });
 
       if (!response.ok) {
-        if (shouldTrackGithubSignup) {
-          window.sessionStorage.removeItem(PENDING_GITHUB_SIGNUP_STORAGE_KEY);
+        if (shouldTrackSocialSignup) {
+          window.sessionStorage.removeItem(PENDING_SOCIAL_SIGNUP_STORAGE_KEY);
         }
         setAuthInfo(getAuthInfoForMode(authMode));
-        setAuthError(getErrorMessage(payload, `GitHub sign-in failed with ${response.status}.`));
+        setAuthError(getErrorMessage(payload, `${getSocialProviderLabel(provider)} sign-in failed with ${response.status}.`));
         trackPosthogEvent("den_auth_failed", {
           mode: authMode,
-          method: "github",
+          method: provider,
           status: response.status
         });
         setAuthBusy(false);
@@ -1276,14 +2047,14 @@ export function CloudControlPanel() {
       const redirectUrl = payloadUrl || headerUrl;
 
       if (!redirectUrl) {
-        if (shouldTrackGithubSignup) {
-          window.sessionStorage.removeItem(PENDING_GITHUB_SIGNUP_STORAGE_KEY);
+        if (shouldTrackSocialSignup) {
+          window.sessionStorage.removeItem(PENDING_SOCIAL_SIGNUP_STORAGE_KEY);
         }
         setAuthInfo(getAuthInfoForMode(authMode));
-        setAuthError("GitHub sign-in did not return a redirect URL.");
+        setAuthError(`${getSocialProviderLabel(provider)} sign-in did not return a redirect URL.`);
         trackPosthogEvent("den_auth_failed", {
           mode: authMode,
-          method: "github",
+          method: provider,
           reason: "missing_redirect_url"
         });
         setAuthBusy(false);
@@ -1292,19 +2063,19 @@ export function CloudControlPanel() {
 
       trackPosthogEvent("den_auth_redirected", {
         mode: authMode,
-        method: "github"
+        method: provider
       });
       window.location.assign(redirectUrl);
     } catch (error) {
-      if (shouldTrackGithubSignup) {
-        window.sessionStorage.removeItem(PENDING_GITHUB_SIGNUP_STORAGE_KEY);
+      if (shouldTrackSocialSignup) {
+        window.sessionStorage.removeItem(PENDING_SOCIAL_SIGNUP_STORAGE_KEY);
       }
       const message = error instanceof Error ? error.message : "Unknown network error";
       setAuthInfo(getAuthInfoForMode(authMode));
       setAuthError(message);
       trackPosthogEvent("den_auth_failed", {
         mode: authMode,
-        method: "github",
+        method: provider,
         reason: "network_error"
       });
       setAuthBusy(false);
@@ -1339,6 +2110,11 @@ export function CloudControlPanel() {
     setWorkersError(null);
     setLaunchError(null);
     setCheckoutUrl(null);
+    setBillingSummary(null);
+    setBillingError(null);
+    setBillingBusy(false);
+    setBillingCheckoutBusy(false);
+    setBillingSubscriptionBusy(false);
     setPaymentReturned(false);
     setTokenFetchedForWorkerId(null);
     setDeleteBusyWorkerId(null);
@@ -1349,6 +2125,8 @@ export function CloudControlPanel() {
     setWorkerQuery("");
     setWorkerStatusFilter("all");
     setShowLaunchForm(false);
+    setMobileWorkersExpanded(false);
+    setPendingRestoredWorkerId(null);
     setAuthMode("sign-up");
     setEmail("");
     setPassword("");
@@ -1360,7 +2138,7 @@ export function CloudControlPanel() {
 
     if (typeof window !== "undefined") {
       window.localStorage.removeItem(LAST_WORKER_STORAGE_KEY);
-      window.sessionStorage.removeItem(PENDING_GITHUB_SIGNUP_STORAGE_KEY);
+      window.sessionStorage.removeItem(PENDING_SOCIAL_SIGNUP_STORAGE_KEY);
     }
   }
 
@@ -1393,15 +2171,41 @@ export function CloudControlPanel() {
         12000
       );
 
-      if (response.status === 402) {
-        const url = getCheckoutUrl(payload);
-        setCheckoutUrl(url);
-        setLaunchStatus("Payment is required. Complete checkout and return to continue launch.");
-        setLaunchError(url ? null : "Checkout URL missing from paywall response.");
-        appendEvent("warning", "Paywall required", url ? "Checkout URL generated" : "Checkout URL missing");
-        trackPosthogEvent("den_paywall_required", {
-          checkout_url_present: Boolean(url)
-        });
+      // TODO(den-free-first-worker): Restore this 402 paywall branch after the one-worker experiment ends.
+      // if (response.status === 402) {
+      //   const url = getCheckoutUrl(payload);
+      //   setCheckoutUrl(url);
+      //   setShellView("billing");
+      //   setBillingSummary((current) => {
+      //     if (!current) {
+      //       return current;
+      //     }
+      //
+      //     return {
+      //       ...current,
+      //       hasActivePlan: false,
+      //       checkoutRequired: true,
+      //       checkoutUrl: url ?? current.checkoutUrl
+      //     };
+      //   });
+      //   setLaunchStatus("Payment is required. Complete checkout and return to continue launch.");
+      //   setLaunchError(url ? null : "Checkout URL missing from paywall response.");
+      //   appendEvent("warning", "Paywall required", url ? "Checkout URL generated" : "Checkout URL missing");
+      //   trackPosthogEvent("den_paywall_required", {
+      //     checkout_url_present: Boolean(url)
+      //   });
+      //
+      //   if (!url) {
+      //     void refreshBilling({ includeCheckout: true, quiet: true });
+      //   }
+      //
+      //   return;
+      // }
+      if (response.status === 409) {
+        const message = getErrorMessage(payload, "You can only create one cloud worker during this experiment.");
+        setLaunchStatus("Worker limit reached.");
+        setLaunchError(message);
+        appendEvent("warning", "Worker limit reached", message);
         return;
       }
 
@@ -1430,6 +2234,7 @@ export function CloudControlPanel() {
       const resolvedWorker = await withResolvedOpenworkCredentials(parsedWorker);
       setWorker(resolvedWorker);
       setWorkerLookupId(parsedWorker.workerId);
+      setPendingRestoredWorkerId(null);
       setPaymentReturned(false);
       setCheckoutUrl(null);
       setShowLaunchForm(false);
@@ -1544,6 +2349,7 @@ export function CloudControlPanel() {
 
       const resolvedWorker = await withResolvedOpenworkCredentials(nextWorker, { quiet: true });
       setWorker(resolvedWorker);
+      setPendingRestoredWorkerId(null);
 
       setWorkerLookupId(summary.workerId);
 
@@ -1639,6 +2445,7 @@ export function CloudControlPanel() {
 
       const resolvedWorker = await withResolvedOpenworkCredentials(nextWorker, { quiet: true });
       setWorker(resolvedWorker);
+      setPendingRestoredWorkerId(null);
 
       setLaunchStatus("Worker is ready to connect.");
       appendEvent("success", "Access token ready", `Worker ID ${id}`);
@@ -1658,7 +2465,7 @@ export function CloudControlPanel() {
       return;
     }
 
-    if (deleteBusyWorkerId || actionBusy !== null || launchBusy) {
+    if (deleteBusyWorkerId || redeployBusyWorkerId || actionBusy !== null || launchBusy) {
       return;
     }
 
@@ -1696,6 +2503,7 @@ export function CloudControlPanel() {
         }
         return null;
       });
+      setPendingRestoredWorkerId((current) => (current === workerId ? null : current));
 
       setWorkerLookupId((current) => (current === workerId ? "" : current));
 
@@ -1715,8 +2523,104 @@ export function CloudControlPanel() {
     }
   }
 
+  async function handleRedeployWorker(workerId: string) {
+    if (!user) {
+      setLaunchError("Sign in before redeploying a worker.");
+      return;
+    }
+
+    if (redeployBusyWorkerId || deleteBusyWorkerId || actionBusy !== null || launchBusy) {
+      return;
+    }
+
+    const target = workers.find((entry) => entry.workerId === workerId) ?? null;
+    const workerLabel = target?.workerName?.trim() || "Cloud Worker";
+
+    if (typeof window !== "undefined") {
+      const confirmed = window.confirm(
+        `Redeploy "${workerLabel}"? This removes the current worker and creates a new one with the same name.`
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    setRedeployBusyWorkerId(workerId);
+    setLaunchError(null);
+    setCheckoutUrl(null);
+    setLaunchStatus(`Redeploying ${workerLabel}...`);
+    appendEvent("info", "Redeploy requested", workerLabel);
+
+    try {
+      const { response: deleteResponse, payload: deletePayload } = await requestJson(`/v1/workers/${encodeURIComponent(workerId)}`, {
+        method: "DELETE",
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
+      });
+
+      if (deleteResponse.status !== 204 && !deleteResponse.ok) {
+        const message = getErrorMessage(deletePayload, `Redeploy failed while deleting (${deleteResponse.status}).`);
+        setLaunchError(message);
+        appendEvent("error", "Redeploy failed", message);
+        return;
+      }
+
+      const { response: createResponse, payload: createPayload } = await requestJson(
+        "/v1/workers",
+        {
+          method: "POST",
+          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+          body: JSON.stringify({
+            name: workerLabel,
+            destination: "cloud"
+          })
+        },
+        12000
+      );
+
+      if (!createResponse.ok) {
+        const message = getErrorMessage(createPayload, `Redeploy failed while creating (${createResponse.status}).`);
+        setLaunchError(message);
+        appendEvent("error", "Redeploy failed", message);
+        return;
+      }
+
+      const parsedWorker = getWorker(createPayload);
+      if (!parsedWorker) {
+        setLaunchError("Redeploy response was missing worker details.");
+        appendEvent("error", "Redeploy failed", "Worker payload missing");
+        return;
+      }
+
+      const resolvedWorker = await withResolvedOpenworkCredentials(parsedWorker, { quiet: true });
+      setWorker(resolvedWorker);
+      setWorkerLookupId(parsedWorker.workerId);
+      setPendingRestoredWorkerId(null);
+      setPaymentReturned(false);
+      setShowLaunchForm(false);
+
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(LAST_WORKER_STORAGE_KEY, parsedWorker.workerId);
+      }
+
+      if (resolvedWorker.status === "provisioning") {
+        setLaunchStatus(`Redeploy started for ${workerLabel}. This can take a few minutes.`);
+        appendEvent("info", "Redeploy started", `Worker ID ${parsedWorker.workerId}`);
+      } else {
+        setLaunchStatus(getWorkerStatusCopy(resolvedWorker.status));
+        appendEvent("success", "Worker redeployed", workerLabel);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown network error";
+      setLaunchError(message);
+      appendEvent("error", "Redeploy failed", message);
+    } finally {
+      setRedeployBusyWorkerId(null);
+      void refreshWorkers({ keepSelection: true });
+    }
+  }
+
   return (
-    <section className={`ow-card${isShellStep ? " ow-card-shell" : ""}`}>
+    <section className={`ow-card${isShellStep ? " ow-card-shell" : " ow-card-auth"}`}>
       {!isShellStep ? (
         <div className="ow-progress-track">
           <span className="ow-progress-fill" style={{ width: progressWidth }} />
@@ -1726,18 +2630,47 @@ export function CloudControlPanel() {
       <div className="ow-card-body">
 
         {step === 1 ? (
-          <div className="ow-stack">
+          <div className="ow-stack ow-auth-panel">
             <div className="ow-heading-block">
               <span className="ow-icon-chip">01</span>
               <h1 className="ow-title">{authMode === "sign-up" ? "Get started" : "Welcome back"}</h1>
               <p className="ow-subtitle">
-                {authMode === "sign-up"
-                  ? getAuthInfoForMode("sign-up")
-                  : getAuthInfoForMode("sign-in")}
+                {authMode === "sign-up" ? (
+                  <>
+                    <span className="ow-subtitle-line">Create an account to launch</span>
+                    <span className="ow-subtitle-line">and manage cloud workers.</span>
+                  </>
+                ) : (
+                  getAuthInfoForMode("sign-in")
+                )}
               </p>
             </div>
 
             <form className="ow-stack" onSubmit={handleAuthSubmit}>
+              <button
+                type="button"
+                className="ow-btn-secondary ow-social-btn"
+                onClick={() => void handleSocialSignIn("github")}
+                disabled={authBusy}
+              >
+                <GitHubLogo />
+                <span>Continue with GitHub</span>
+              </button>
+
+              <button
+                type="button"
+                className="ow-btn-secondary ow-social-btn"
+                onClick={() => void handleSocialSignIn("google")}
+                disabled={authBusy}
+              >
+                <GoogleLogo />
+                <span>Continue with Google</span>
+              </button>
+
+              <div className="ow-divider" aria-hidden="true">
+                <span>or</span>
+              </div>
+
               <label className="ow-field-block">
                 <span className="ow-field-label">Email</span>
                 <input
@@ -1765,10 +2698,6 @@ export function CloudControlPanel() {
               <button type="submit" className="ow-btn-primary" disabled={authBusy}>
                 {authBusy ? "Working..." : authMode === "sign-in" ? "Sign in" : "Create account"}
               </button>
-
-              <button type="button" className="ow-btn-secondary w-full" onClick={() => void handleGitHubSignIn()} disabled={authBusy}>
-                Continue with GitHub
-              </button>
             </form>
 
             <div className="ow-inline-row">
@@ -1787,10 +2716,12 @@ export function CloudControlPanel() {
               </button>
             </div>
 
-            <div className="ow-note-box">
-              <p>{authInfo}</p>
-              {authError ? <p className="ow-error-text">{authError}</p> : null}
-            </div>
+            {showAuthFeedback ? (
+              <div className="ow-auth-feedback" aria-live="polite">
+                {authInfo !== defaultAuthInfo ? <p>{authInfo}</p> : null}
+                {authError ? <p className="ow-error-text">{authError}</p> : null}
+              </div>
+            ) : null}
           </div>
         ) : null}
 
@@ -1807,7 +2738,8 @@ export function CloudControlPanel() {
                 >
                   Workers
                 </button>
-                <button
+                {/* TODO(den-free-first-worker): Restore Billing nav button after the experiment. */}
+                {/* <button
                   type="button"
                   onClick={() => setShellView("billing")}
                   className={`rounded-[12px] px-3 py-1.5 text-sm font-medium transition ${
@@ -1815,7 +2747,7 @@ export function CloudControlPanel() {
                   }`}
                 >
                   Billing
-                </button>
+                </button> */}
               </div>
               <button
                 type="button"
@@ -1827,7 +2759,7 @@ export function CloudControlPanel() {
               </button>
             </div>
 
-            {shellView === "workers" ? (
+            {shellView === "workers" || BILLING_DISABLED_FOR_EXPERIMENT ? (
               <div className="flex h-full min-h-0 flex-col gap-4 lg:flex-row">
                 <aside className="hidden h-full w-[260px] shrink-0 flex-col justify-between rounded-[32px] border border-slate-200 bg-white p-5 shadow-sm lg:flex">
                   <div>
@@ -1843,13 +2775,14 @@ export function CloudControlPanel() {
                         >
                           Workers
                         </button>
-                        <button
+                        {/* TODO(den-free-first-worker): Restore Billing sidebar button after the experiment. */}
+                        {/* <button
                           type="button"
                           className="w-full rounded-[14px] px-3 py-2.5 text-left text-sm font-medium text-slate-500 transition hover:bg-slate-50"
                           onClick={() => setShellView("billing")}
                         >
                           Billing
-                        </button>
+                        </button> */}
                         <span className="block rounded-[14px] px-3 py-2.5 text-sm font-medium text-slate-400">Settings</span>
                         <span className="block rounded-[14px] px-3 py-2.5 text-sm font-medium text-slate-400">Help Center</span>
                       </nav>
@@ -1870,7 +2803,148 @@ export function CloudControlPanel() {
                   </div>
                 </aside>
 
-                <section className="flex h-full w-full shrink-0 flex-col rounded-[32px] border border-slate-200 bg-white p-6 shadow-sm md:w-[340px]">
+                <section className="flex flex-col gap-3 lg:hidden">
+                  <div className="rounded-[28px] border border-slate-200 bg-white p-4 shadow-sm">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <h2 className="text-base font-semibold tracking-tight text-slate-900">Workers</h2>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {workers.length > 0
+                            ? mobileWorkersExpanded
+                              ? `Showing ${filteredWorkers.length} of ${workers.length}`
+                              : mobilePreviewWorker
+                                ? "Selected worker stays pinned here."
+                                : "Choose a worker to see its details."
+                            : "No workers yet."}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          className="rounded-full bg-[#1B29FF] px-3 py-2 text-xs font-semibold text-white transition hover:bg-[#151FDA]"
+                          onClick={() => {
+                            setShowLaunchForm((current) => !current);
+                            setMobileWorkersExpanded(true);
+                          }}
+                        >
+                          {showLaunchForm ? "Close" : "New"}
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded-full border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                          onClick={() => setMobileWorkersExpanded((current) => !current)}
+                          disabled={!mobilePreviewWorker && filteredWorkers.length === 0}
+                        >
+                          {mobileWorkersExpanded ? "Collapse" : `Show all${filteredWorkers.length > 1 ? ` (${filteredWorkers.length})` : ""}`}
+                        </button>
+                      </div>
+                    </div>
+
+                    {showLaunchForm ? (
+                      <div className="mt-4 rounded-[20px] border border-slate-200 bg-slate-50 p-4">
+                        <label className="mb-3 block">
+                          <span className="mb-1 block text-xs font-bold uppercase tracking-[0.08em] text-slate-500">Worker Name</span>
+                          <input
+                            className="w-full rounded-[12px] border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-[#1B29FF] focus:ring-2 focus:ring-[#1B29FF]/15"
+                            value={workerName}
+                            onChange={(event) => setWorkerName(event.target.value)}
+                            maxLength={80}
+                          />
+                        </label>
+
+                        <button
+                          type="button"
+                          className="w-full rounded-[12px] bg-[#1B29FF] px-3 py-2.5 text-sm font-semibold text-white transition hover:bg-[#151FDA] disabled:cursor-not-allowed disabled:opacity-60"
+                          onClick={handleLaunchWorker}
+                          disabled={!user || launchBusy || worker?.status === "provisioning" || workerLimitReached}
+                        >
+                          {launchBusy
+                            ? "Starting worker..."
+                            : workerLimitReached
+                              ? "Worker limit reached"
+                            : worker?.status === "provisioning"
+                              ? "Worker is starting..."
+                              : `Launch "${workerName || "Cloud Worker"}"`}
+                        </button>
+
+                        {(launchStatus || launchError) && showLaunchForm ? (
+                          <div className="mt-3 rounded-[12px] border border-slate-200 bg-white px-3 py-2">
+                            <p className="text-xs text-slate-600">{launchStatus}</p>
+                            {launchError ? <p className="mt-1 text-xs font-medium text-rose-600">{launchError}</p> : null}
+                          </div>
+                        ) : null}
+
+                        {workerLimitReached ? (
+                          <a
+                            href={getAdditionalWorkerRequestHref()}
+                            className="mt-3 inline-flex w-full items-center justify-center rounded-[12px] border border-slate-300 bg-white px-3 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-400 hover:text-slate-900"
+                          >
+                            Request an additional worker
+                          </a>
+                        ) : null}
+
+                        {effectiveCheckoutUrl ? (
+                          <div className="mt-3 rounded-[12px] border border-amber-200 bg-amber-50 px-3 py-2.5">
+                            <p className="text-sm font-semibold text-amber-800">Payment needed before launch</p>
+                            <a
+                              href={effectiveCheckoutUrl}
+                              rel="noreferrer"
+                              className="mt-2 inline-flex rounded-[10px] border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-800 transition hover:bg-amber-100"
+                            >
+                              Continue to checkout
+                            </a>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    {mobileWorkersExpanded || showLaunchForm ? (
+                      <div className="mt-4 flex gap-2 overflow-x-auto pb-1">
+                        <input
+                          className="min-w-[170px] rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-[#1B29FF]"
+                          value={workerQuery}
+                          onChange={(event) => setWorkerQuery(event.target.value)}
+                          placeholder="Search..."
+                          aria-label="Search workers"
+                        />
+                        <select
+                          className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 outline-none"
+                          value={workerStatusFilter}
+                          onChange={(event) => setWorkerStatusFilter(event.target.value as WorkerStatusBucket | "all")}
+                        >
+                          <option value="all">All</option>
+                          <option value="ready">Ready</option>
+                          <option value="starting">Starting</option>
+                          <option value="attention">Attention</option>
+                        </select>
+                      </div>
+                    ) : null}
+
+                    {workersBusy ? <p className="mt-3 text-xs text-slate-500">Loading workers...</p> : null}
+                    {workersError ? <p className="mt-3 text-xs font-medium text-rose-600">{workersError}</p> : null}
+
+                    <div className="mt-4 space-y-3">
+                      {mobilePreviewWorker ? renderWorkerRow(mobilePreviewWorker, { collapseMobile: true, dense: true }) : null}
+
+                      {mobileWorkersExpanded ? (
+                        <div className="space-y-3 border-t border-slate-100 pt-3">
+                          {filteredWorkers
+                            .filter((item) => item.workerId !== mobilePreviewWorker?.workerId)
+                            .map((item) => renderWorkerRow(item, { collapseMobile: true, dense: true }))}
+                          {workers.length > 0 && filteredWorkers.length === 0 ? (
+                            <p className="text-xs text-slate-500">No workers match this filter.</p>
+                          ) : null}
+                        </div>
+                      ) : null}
+
+                      {workers.length === 0 && !workersBusy ? (
+                        <p className="text-xs text-slate-500">No workers yet. Create one to get started.</p>
+                      ) : null}
+                    </div>
+                  </div>
+                </section>
+
+                <section className="hidden h-full w-full shrink-0 flex-col rounded-[32px] border border-slate-200 bg-white p-6 shadow-sm md:w-[340px] lg:flex">
                   <div className="mb-6 flex items-center justify-between">
                     <h2 className="text-xl font-semibold tracking-tight text-slate-900">Workers</h2>
                     <button
@@ -1898,10 +2972,12 @@ export function CloudControlPanel() {
                         type="button"
                         className="w-full rounded-[12px] bg-[#1B29FF] px-3 py-2.5 text-sm font-semibold text-white transition hover:bg-[#151FDA] disabled:cursor-not-allowed disabled:opacity-60"
                         onClick={handleLaunchWorker}
-                        disabled={!user || launchBusy || worker?.status === "provisioning"}
+                        disabled={!user || launchBusy || worker?.status === "provisioning" || workerLimitReached}
                       >
                         {launchBusy
                           ? "Starting worker..."
+                          : workerLimitReached
+                            ? "Worker limit reached"
                           : worker?.status === "provisioning"
                             ? "Worker is starting..."
                             : `Launch "${workerName || "Cloud Worker"}"`}
@@ -1914,18 +2990,29 @@ export function CloudControlPanel() {
                         </div>
                       ) : null}
 
-                      {checkoutUrl ? (
+                      {workerLimitReached ? (
+                        <a
+                          href={getAdditionalWorkerRequestHref()}
+                          className="mt-3 inline-flex w-full items-center justify-center rounded-[12px] border border-slate-300 bg-white px-3 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-400 hover:text-slate-900"
+                        >
+                          Request an additional worker
+                        </a>
+                      ) : null}
+
+                      {/* TODO(den-free-first-worker): Restore checkout CTA block when paywall returns. */}
+                      {/* {effectiveCheckoutUrl ? (
                         <div className="mt-3 rounded-[12px] border border-amber-200 bg-amber-50 px-3 py-2.5">
                           <p className="text-sm font-semibold text-amber-800">Payment needed before launch</p>
                           <a
-                            href={checkoutUrl}
+                            href={effectiveCheckoutUrl}
                             rel="noreferrer"
                             className="mt-2 inline-flex rounded-[10px] border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-800 transition hover:bg-amber-100"
                           >
                             Continue to checkout
                           </a>
                         </div>
-                      ) : null}
+                      ) : null} */}
+
                     </div>
                   ) : null}
 
@@ -1953,61 +3040,7 @@ export function CloudControlPanel() {
                   {workersError ? <p className="mb-2 text-xs font-medium text-rose-600">{workersError}</p> : null}
 
                   <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
-                    {filteredWorkers.map((item) => {
-                      const meta = getWorkerStatusMeta(item.status);
-                      const isActive = workerLookupId === item.workerId;
-                      const statusPill =
-                        meta.bucket === "ready"
-                          ? "bg-[#E8F5E9] text-[#2E7D32]"
-                          : meta.bucket === "starting"
-                            ? "bg-amber-100 text-amber-700"
-                            : meta.bucket === "attention"
-                              ? "bg-rose-100 text-rose-700"
-                              : "bg-slate-100 text-slate-500";
-
-                      const statusDot =
-                        meta.bucket === "ready"
-                          ? "bg-[#2E7D32]"
-                          : meta.bucket === "starting"
-                            ? "bg-amber-500"
-                            : meta.bucket === "attention"
-                              ? "bg-rose-500"
-                              : "bg-slate-400";
-
-                      return (
-                        <button
-                          key={item.workerId}
-                          type="button"
-                          onClick={() => {
-                            setWorkerLookupId(item.workerId);
-                            setWorker((current) => listItemToWorker(item, current));
-                          }}
-                          className={`w-full rounded-[20px] border p-4 text-left transition-all ${
-                            isActive
-                              ? "border-[#1B29FF] bg-[#1B29FF]/[0.03] ring-1 ring-[#1B29FF]/30"
-                              : "border-slate-100 bg-white hover:border-slate-300"
-                          }`}
-                        >
-                          <div className="mb-1 flex items-center justify-between gap-2">
-                            <span className={`truncate pr-2 text-sm font-semibold ${isActive ? "text-[#1B29FF]" : "text-slate-700"}`}>
-                              {item.workerName}
-                            </span>
-                            {item.isMine ? (
-                              <span className="shrink-0 rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                                Yours
-                              </span>
-                            ) : null}
-                          </div>
-                          <div className="mt-3 flex items-center justify-between">
-                            <span className="font-mono text-xs font-medium text-slate-400">{getWorkerAddressLabel(item)}</span>
-                            <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${statusPill}`}>
-                              <span className={`h-1.5 w-1.5 rounded-full ${statusDot}`} />
-                              {meta.label}
-                            </span>
-                          </div>
-                        </button>
-                      );
-                    })}
+                    {filteredWorkers.map((item) => renderWorkerRow(item))}
                   </div>
 
                   {workers.length > 0 && filteredWorkers.length === 0 ? (
@@ -2028,28 +3061,113 @@ export function CloudControlPanel() {
 
                       <div className="min-h-0 flex-1 space-y-6 overflow-y-auto pb-2">
                         <div className="rounded-[28px] border border-slate-100 bg-white p-6">
-                          <h2 className="mb-2 text-3xl font-bold tracking-tight text-slate-900">
-                            {activeWorker?.workerName ?? selectedWorker.workerName}
-                          </h2>
+                          <div className="mb-2 flex items-start justify-between gap-4">
+                            <h2 className="text-3xl font-bold tracking-tight text-slate-900">
+                              {activeWorker?.workerName ?? selectedWorker.workerName}
+                            </h2>
+                            {openworkAppConnectUrl ? (
+                              <a
+                                href={openworkAppConnectUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className={`shrink-0 rounded-[16px] px-6 py-3 text-base font-semibold shadow-md shadow-[#1B29FF]/25 transition ${
+                                  selectedStatusMeta.bucket === "ready"
+                                    ? "bg-[#1B29FF] text-white hover:bg-[#151FDA]"
+                                    : "pointer-events-none cursor-not-allowed bg-slate-200 text-slate-500 shadow-none"
+                                }`}
+                                aria-disabled={selectedStatusMeta.bucket !== "ready"}
+                              >
+                                Open in Web
+                              </a>
+                            ) : null}
+                          </div>
                           <p className="mb-6 text-sm text-slate-500">{getWorkerStatusCopy(selectedWorkerStatus)}</p>
+                          {isSelectedWorkerFailed ? (
+                            <button
+                              type="button"
+                              className="rounded-[12px] bg-[#1B29FF] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#151FDA] disabled:cursor-not-allowed disabled:opacity-50"
+                              onClick={() => void handleRedeployWorker(selectedWorker.workerId)}
+                              disabled={redeployBusyWorkerId !== null || deleteBusyWorkerId !== null || actionBusy !== null || launchBusy}
+                            >
+                              {redeployBusyWorkerId === selectedWorker.workerId ? "Redeploying..." : "Redeploy"}
+                            </button>
+                          ) : null}
+                        </div>
 
-                          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                            <div className="rounded-[20px] border border-slate-100 bg-white p-4">
-                              <p className="text-sm font-medium text-slate-500">Status</p>
-                              <p className="mt-2 text-2xl font-bold text-slate-900">{selectedStatusMeta.label}</p>
+                        <div className="rounded-[28px] border border-slate-100 bg-white p-6">
+                          <div className="mb-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                            <div>
+                              <h3 className="text-lg font-bold tracking-tight text-slate-900">Worker runtime</h3>
+                              <p className="text-sm text-slate-500">Compare installed runtime versions with the versions this worker should be running.</p>
                             </div>
-                            <div className="rounded-[20px] border border-slate-100 bg-white p-4">
-                              <p className="text-sm font-medium text-slate-500">Connection</p>
-                              <p className="mt-2 text-2xl font-bold text-slate-900">{openworkDeepLink ? "Ready" : "Preparing"}</p>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <button
+                                type="button"
+                                className="rounded-[12px] border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                                onClick={() => void refreshRuntime(selectedWorker.workerId)}
+                                disabled={runtimeBusy || runtimeUpgradeBusy}
+                              >
+                                {runtimeBusy ? "Checking..." : "Refresh runtime"}
+                              </button>
+                              <button
+                                type="button"
+                                className="rounded-[12px] bg-[#1B29FF] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#151FDA] disabled:cursor-not-allowed disabled:opacity-50"
+                                onClick={() => void handleRuntimeUpgrade()}
+                                disabled={runtimeUpgradeBusy || runtimeBusy || selectedStatusMeta.bucket !== "ready"}
+                              >
+                                {runtimeUpgradeBusy || runtimeSnapshot?.upgrade.status === "running" ? "Upgrading..." : "Upgrade runtime"}
+                              </button>
                             </div>
+                          </div>
+
+                          {runtimeError ? (
+                            <div className="mb-4 rounded-[14px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{runtimeError}</div>
+                          ) : null}
+
+                          {runtimeSnapshot?.upgrade.status === "failed" && runtimeSnapshot.upgrade.error ? (
+                            <div className="mb-4 rounded-[14px] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                              Last upgrade failed: {runtimeSnapshot.upgrade.error}
+                            </div>
+                          ) : null}
+
+                          {runtimeUpgradeCount > 0 ? (
+                            <div className="mb-4 rounded-[14px] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                              This worker has {runtimeUpgradeCount} runtime component{runtimeUpgradeCount === 1 ? "" : "s"} behind the target version.
+                            </div>
+                          ) : null}
+
+                          <div className="space-y-3">
+                            {(runtimeSnapshot?.services ?? []).map((service) => (
+                              <div key={service.name} className="flex flex-col gap-3 rounded-[18px] border border-slate-100 bg-slate-50 px-4 py-3 md:flex-row md:items-center md:justify-between">
+                                <div>
+                                  <p className="text-sm font-semibold text-slate-900">{getRuntimeServiceLabel(service.name)}</p>
+                                  <p className="text-xs text-slate-500">
+                                    Installed {service.actualVersion ?? "unknown"} · Target {service.targetVersion ?? "unknown"}
+                                  </p>
+                                </div>
+                                <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide">
+                                  <span className={`rounded-full px-2.5 py-1 ${service.running ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"}`}>
+                                    {service.running ? "Running" : service.enabled ? "Stopped" : "Disabled"}
+                                  </span>
+                                  <span className={`rounded-full px-2.5 py-1 ${service.upgradeAvailable ? "bg-amber-100 text-amber-700" : "bg-slate-200 text-slate-600"}`}>
+                                    {service.upgradeAvailable ? "Upgrade available" : "Current"}
+                                  </span>
+                                </div>
+                              </div>
+                            ))}
+                            {!runtimeSnapshot && !runtimeBusy ? (
+                              <p className="text-sm text-slate-500">Runtime details appear after the worker is reachable.</p>
+                            ) : null}
                           </div>
                         </div>
 
                         <div className="rounded-[28px] border border-slate-100 bg-white p-6">
-                          <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                          <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
                             <div>
-                              <h3 className="text-lg font-bold tracking-tight text-slate-900">Connection Details</h3>
-                              <p className="text-sm text-slate-500">Access and manage your worker instance.</p>
+                              <div>
+                                <h3 className="text-lg font-bold tracking-tight text-slate-900">Connection Details</h3>
+                                <p className="text-sm text-slate-500">Access and manage your worker instance.</p>
+                              </div>
                             </div>
 
                             <div className="flex flex-wrap items-center gap-2">
@@ -2066,22 +3184,6 @@ export function CloudControlPanel() {
                               >
                                 {openworkDeepLink ? "Open in OpenWork" : "Preparing connection..."}
                               </button>
-
-                              {openworkAppConnectUrl ? (
-                                <a
-                                  href={openworkAppConnectUrl}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className={`rounded-[14px] border px-5 py-3 text-sm font-semibold transition ${
-                                    selectedStatusMeta.bucket === "ready"
-                                      ? "border-slate-300 bg-white text-slate-700 hover:border-slate-400 hover:text-slate-900"
-                                      : "pointer-events-none cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400"
-                                  }`}
-                                  aria-disabled={selectedStatusMeta.bucket !== "ready"}
-                                >
-                                  Open in App
-                                </a>
-                              ) : null}
                             </div>
                           </div>
 
@@ -2089,7 +3191,7 @@ export function CloudControlPanel() {
                             <p className="text-sm text-slate-600">
                               {openworkDeepLink
                                 ? openworkAppConnectUrl
-                                  ? "You are all set. Open in OpenWork or Open in App to start working."
+                                  ? "You are all set. Open in OpenWork or Open in Web to start working."
                                   : "You are all set. Open in OpenWork to start working."
                                 : "We are still preparing your connection. The button will unlock when ready."}
                             </p>
@@ -2212,9 +3314,23 @@ export function CloudControlPanel() {
                                       </button>
                                       <button
                                         type="button"
+                                        className="rounded-[10px] border border-[#1B29FF]/20 bg-[#1B29FF]/5 px-3 py-2 text-xs font-semibold text-[#1B29FF] transition hover:bg-[#1B29FF]/10 disabled:cursor-not-allowed disabled:opacity-50"
+                                        onClick={() => void handleRedeployWorker(selectedWorker.workerId)}
+                                        disabled={
+                                          !isSelectedWorkerFailed ||
+                                          redeployBusyWorkerId !== null ||
+                                          deleteBusyWorkerId !== null ||
+                                          actionBusy !== null ||
+                                          launchBusy
+                                        }
+                                      >
+                                        {redeployBusyWorkerId === selectedWorker.workerId ? "Redeploying..." : "Redeploy"}
+                                      </button>
+                                      <button
+                                        type="button"
                                         className="rounded-[10px] border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
                                         onClick={() => void handleDeleteWorker(selectedWorker.workerId)}
-                                        disabled={deleteBusyWorkerId !== null || actionBusy !== null || launchBusy}
+                                        disabled={deleteBusyWorkerId !== null || redeployBusyWorkerId !== null || actionBusy !== null || launchBusy}
                                       >
                                         {deleteBusyWorkerId === selectedWorker.workerId ? "Deleting..." : "Delete worker"}
                                       </button>
@@ -2288,22 +3404,221 @@ export function CloudControlPanel() {
               </div>
             ) : (
               <section className="flex h-full flex-1 flex-col rounded-[32px] border border-slate-200 bg-white p-6 shadow-sm md:p-8">
-                <h2 className="text-2xl font-bold tracking-tight text-slate-900">Billing</h2>
-                <p className="mt-1 text-sm text-slate-500">Handle checkout when launching a new worker.</p>
-                {checkoutUrl ? (
-                  <div className="mt-5 rounded-[16px] border border-amber-200 bg-amber-50 p-4">
-                    <p className="text-sm font-semibold text-amber-800">Checkout in progress</p>
-                    <a
-                      href={checkoutUrl}
-                      rel="noreferrer"
-                      className="mt-2 inline-flex rounded-[10px] border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-800 transition hover:bg-amber-100"
-                    >
-                      Continue to checkout
-                    </a>
+                <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-2xl font-bold tracking-tight text-slate-900">Billing</h2>
+                    <p className="mt-1 text-sm text-slate-500">Check plan status and manage checkout for cloud workers.</p>
                   </div>
-                ) : (
-                  <p className="mt-4 text-sm text-slate-600">No payment action right now.</p>
-                )}
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      className="rounded-[12px] border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+                      onClick={() => void refreshBilling()}
+                      disabled={billingBusy || billingCheckoutBusy || billingSubscriptionBusy}
+                    >
+                      {billingBusy ? "Refreshing..." : "Refresh"}
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-[12px] bg-slate-900 px-3 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+                      onClick={() => setShellView("workers")}
+                    >
+                      Back to workers
+                    </button>
+                  </div>
+                </div>
+
+                {billingError ? (
+                  <div className="mb-4 rounded-[14px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                    {billingError}
+                  </div>
+                ) : null}
+
+                {billingBusy && !billingSummary ? <p className="text-sm text-slate-500">Loading billing status...</p> : null}
+
+                {!user ? (
+                  <div className="rounded-[16px] border border-slate-200 bg-slate-50 p-4">
+                    <p className="text-sm font-semibold text-slate-900">Sign in required</p>
+                    <p className="mt-1 text-sm text-slate-600">Sign in to view subscription details, manage cancellation, and access invoices.</p>
+                  </div>
+                ) : billingSummary ? (
+                  <div className="space-y-4">
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <div className="rounded-[18px] border border-slate-200 bg-slate-50 p-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Plan status</p>
+                        <p className="mt-2 text-lg font-semibold text-slate-900">
+                          {!billingSummary.featureGateEnabled
+                            ? "Billing disabled"
+                            : billingSummary.hasActivePlan
+                              ? "Active plan"
+                              : "Payment required"}
+                        </p>
+                        <p className="mt-1 text-sm text-slate-600">
+                          {!billingSummary.featureGateEnabled
+                            ? "Cloud billing gates are disabled in this environment."
+                            : billingSummary.hasActivePlan
+                              ? "Your account can launch cloud workers right now."
+                              : "Complete checkout to unlock cloud worker launches."}
+                        </p>
+                        <p className="mt-2 text-sm font-semibold text-slate-900">
+                          {billingPrice && billingPrice.amount !== null
+                            ? `You are paying ${formatMoneyMinor(billingPrice.amount, billingPrice.currency)} ${formatRecurringInterval(billingPrice.recurringInterval, billingPrice.recurringIntervalCount)}.`
+                            : "Current plan amount is unavailable."}
+                        </p>
+                      </div>
+
+                      <div className="rounded-[18px] border border-slate-200 bg-slate-50 p-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Account</p>
+                        <p className="mt-2 break-all text-sm font-semibold text-slate-900">{(user?.email ?? email) || "account"}</p>
+                        <p className="mt-2 text-xs text-slate-500">
+                          Product: {billingSummary.productId ? shortValue(billingSummary.productId) : "Not configured"}
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          Benefit: {billingSummary.benefitId ? shortValue(billingSummary.benefitId) : "Not configured"}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <div className="rounded-[18px] border border-slate-200 bg-white p-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Subscription</p>
+                        {billingSubscription ? (
+                          <>
+                            <p className="mt-2 text-base font-semibold text-slate-900">{formatSubscriptionStatus(billingSubscription.status)}</p>
+                            <p className="mt-1 text-sm text-slate-600">
+                              {formatMoneyMinor(billingSubscription.amount, billingSubscription.currency)} {formatRecurringInterval(billingSubscription.recurringInterval, billingSubscription.recurringIntervalCount)}
+                            </p>
+                            <p className="mt-2 text-xs text-slate-500">
+                              {billingSubscription.cancelAtPeriodEnd
+                                ? `Cancels on ${formatIsoDate(billingSubscription.currentPeriodEnd)}`
+                                : `Renews on ${formatIsoDate(billingSubscription.currentPeriodEnd)}`}
+                            </p>
+                          </>
+                        ) : (
+                          <p className="mt-2 text-sm text-slate-600">No active subscription found.</p>
+                        )}
+                      </div>
+
+                      <div className="rounded-[18px] border border-slate-200 bg-white p-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Manage subscription</p>
+                        {billingSummary.portalUrl ? (
+                          <a
+                            href={billingSummary.portalUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="mt-2 inline-flex rounded-[10px] border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 hover:text-slate-900"
+                          >
+                            Open billing portal
+                          </a>
+                        ) : (
+                          <button
+                            type="button"
+                            className="mt-2 inline-flex rounded-[10px] border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+                            onClick={() => void refreshBilling({ quiet: true })}
+                            disabled={billingBusy || billingCheckoutBusy || billingSubscriptionBusy}
+                          >
+                            Refresh portal link
+                          </button>
+                        )}
+
+                        {billingSubscription ? (
+                          <button
+                            type="button"
+                            className={`mt-2 inline-flex rounded-[10px] px-3 py-2 text-xs font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                              billingSubscription.cancelAtPeriodEnd ? "bg-slate-700 hover:bg-slate-800" : "bg-rose-600 hover:bg-rose-700"
+                            }`}
+                            onClick={() => void handleSubscriptionCancellation(!billingSubscription.cancelAtPeriodEnd)}
+                            disabled={billingSubscriptionBusy || billingBusy || billingCheckoutBusy}
+                          >
+                            {billingSubscriptionBusy
+                              ? "Updating..."
+                              : billingSubscription.cancelAtPeriodEnd
+                                ? "Resume auto-renew"
+                                : "Cancel at period end"}
+                          </button>
+                        ) : null}
+
+                        <p className="mt-2 text-xs text-slate-500">You can also cancel from the billing portal at any time.</p>
+                      </div>
+                    </div>
+
+                    {effectiveCheckoutUrl ? (
+                      <div className="rounded-[16px] border border-amber-200 bg-amber-50 p-4">
+                        <p className="text-sm font-semibold text-amber-800">Checkout available</p>
+                        <p className="mt-1 text-sm text-amber-700">Use this link to finish billing setup, then return here.</p>
+                        <a
+                          href={effectiveCheckoutUrl}
+                          rel="noreferrer"
+                          className="mt-2 inline-flex rounded-[10px] border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-800 transition hover:bg-amber-100"
+                        >
+                          Continue to checkout
+                        </a>
+                      </div>
+                    ) : null}
+
+                    {billingSummary.featureGateEnabled && !billingSummary.hasActivePlan && !effectiveCheckoutUrl ? (
+                      <div className="rounded-[16px] border border-slate-200 bg-white p-4">
+                        <p className="text-sm font-semibold text-slate-900">Need a checkout link?</p>
+                        <p className="mt-1 text-sm text-slate-600">Generate a fresh checkout session for this account.</p>
+                        <button
+                          type="button"
+                          className="mt-3 rounded-[10px] bg-[#1B29FF] px-3 py-2 text-xs font-semibold text-white transition hover:bg-[#151FDA] disabled:cursor-not-allowed disabled:opacity-60"
+                          onClick={() => void refreshBilling({ includeCheckout: true })}
+                          disabled={billingCheckoutBusy || billingBusy}
+                        >
+                          {billingCheckoutBusy ? "Generating checkout..." : "Generate checkout link"}
+                        </button>
+                      </div>
+                    ) : null}
+
+                    <div className="rounded-[18px] border border-slate-200 bg-white p-4">
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Invoices</p>
+                        <button
+                          type="button"
+                          className="rounded-[10px] border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+                          onClick={() => void refreshBilling({ quiet: true })}
+                          disabled={billingBusy || billingCheckoutBusy || billingSubscriptionBusy}
+                        >
+                          Refresh invoices
+                        </button>
+                      </div>
+
+                      {billingSummary.invoices.length > 0 ? (
+                        <ul className="space-y-2">
+                          {billingSummary.invoices.map((invoice) => (
+                            <li key={invoice.id} className="flex flex-wrap items-center justify-between gap-3 rounded-[12px] border border-slate-100 bg-slate-50 px-3 py-2.5">
+                              <div>
+                                <p className="text-sm font-semibold text-slate-900">{invoice.invoiceNumber ?? shortValue(invoice.id)}</p>
+                                <p className="text-xs text-slate-600">
+                                  {formatIsoDate(invoice.createdAt)} · {formatMoneyMinor(invoice.totalAmount, invoice.currency)} · {formatSubscriptionStatus(invoice.status)}
+                                </p>
+                              </div>
+
+                              {invoice.invoiceUrl ? (
+                                <a
+                                  href={invoice.invoiceUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="rounded-[10px] border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-400 hover:text-slate-900"
+                                >
+                                  Download invoice
+                                </a>
+                              ) : (
+                                <span className="text-xs font-medium text-slate-500">Not available yet</span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-sm text-slate-600">No invoices yet. When charges post, invoices appear here.</p>
+                      )}
+                    </div>
+                  </div>
+                ) : !billingBusy ? (
+                  <p className="text-sm text-slate-600">No billing details available yet. Click refresh to retry.</p>
+                ) : null}
               </section>
             )}
           </div>

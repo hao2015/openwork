@@ -1,12 +1,12 @@
 {
   "name": "openwork-orchestrator",
-  "version": "0.11.127",
+  "version": "0.11.147",
   "opencodeVersion": "1.2.6",
   "description": "OpenWork host orchestrator for opencode + OpenWork server + opencode-router",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun src/cli.ts",
+    "dev": "OPENWORK_DEV_MODE=1 bun src/cli.ts",
     "build": "tsc -p tsconfig.json",
     "build:bin": "node scripts/clean-dist.mjs && bun ./script/build.ts --outdir dist/bin --filename openwork",
     "build:bin:all": "node scripts/clean-dist.mjs && bun ./script/build.ts --outdir dist/bin --filename openwork --target bun-darwin-arm64 --target bun-darwin-x64 --target bun-linux-x64 --target bun-linux-arm64 --target bun-windows-x64",
@@ -14,6 +14,7 @@
     "build:sidecars": "node scripts/build-sidecars.mjs",
     "typecheck": "tsc -p tsconfig.typecheck.json",
     "test:router": "pnpm build && node scripts/router.mjs",
+    "test:files": "pnpm build && node scripts/files-session.mjs",
     "prepublishOnly": "node -e \"console.error('openwork-orchestrator is published via packages/orchestrator/scripts/publish-npm.mjs (meta + platform packages)'); process.exit(1);\""
   },
   "files": [
@@ -47,8 +48,8 @@
     "@opencode-ai/sdk": "^1.1.31",
     "@opentui/core": "0.1.77",
     "@opentui/solid": "0.1.77",
-    "opencode-router": "0.11.127",
-    "openwork-server": "0.11.127",
+    "opencode-router": "0.11.147",
+    "openwork-server": "0.11.147",
     "solid-js": "1.9.9"
   },
   "devDependencies": {

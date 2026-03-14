@@ -6,15 +6,21 @@ set -euo pipefail
 # Usage (from _repos/openwork repo root):
 #   packaging/docker/dev-up.sh
 #
+# Defaults to isolated OpenCode dev state inside the container.
+# Escape hatch: set OPENWORK_DOCKER_DEV_MOUNT_HOST_OPENCODE=1 to import host
+# OpenCode config/auth into the isolated dev state for this stack.
+#
 # Outputs:
 # - Web UI URL
 # - OpenWork server URL
+# - Share service URL
 # - Token file path
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/packaging/docker/docker-compose.dev.yml"
 WORKSPACE_DIR="$ROOT_DIR/packaging/docker/workspace"
 DEV_RUNTIME_DIR="$ROOT_DIR/tmp/docker-dev"
+MOUNT_HOST_OPENCODE="${OPENWORK_DOCKER_DEV_MOUNT_HOST_OPENCODE:-0}"
 
 resolve_opencode_config_dir() {
   local override="${OPENWORK_OPENCODE_CONFIG_DIR:-}"
@@ -115,14 +121,19 @@ OPENCODE_CONFIG_FALLBACK_DIR="$DEV_RUNTIME_DIR/host-opencode-config"
 OPENCODE_DATA_FALLBACK_DIR="$DEV_RUNTIME_DIR/host-opencode-data"
 mkdir -p "$OPENCODE_CONFIG_FALLBACK_DIR" "$OPENCODE_DATA_FALLBACK_DIR"
 
-HOST_OPENCODE_CONFIG_DIR="$(resolve_opencode_config_dir || true)"
-HOST_OPENCODE_DATA_DIR="$(resolve_opencode_data_dir || true)"
+HOST_OPENCODE_CONFIG_DIR="$OPENCODE_CONFIG_FALLBACK_DIR"
+HOST_OPENCODE_DATA_DIR="$OPENCODE_DATA_FALLBACK_DIR"
 
-if [ -z "$HOST_OPENCODE_CONFIG_DIR" ]; then
-  HOST_OPENCODE_CONFIG_DIR="$OPENCODE_CONFIG_FALLBACK_DIR"
-fi
-if [ -z "$HOST_OPENCODE_DATA_DIR" ]; then
-  HOST_OPENCODE_DATA_DIR="$OPENCODE_DATA_FALLBACK_DIR"
+if [ "$MOUNT_HOST_OPENCODE" = "1" ]; then
+  HOST_OPENCODE_CONFIG_DIR="$(resolve_opencode_config_dir || true)"
+  HOST_OPENCODE_DATA_DIR="$(resolve_opencode_data_dir || true)"
+
+  if [ -z "$HOST_OPENCODE_CONFIG_DIR" ]; then
+    HOST_OPENCODE_CONFIG_DIR="$OPENCODE_CONFIG_FALLBACK_DIR"
+  fi
+  if [ -z "$HOST_OPENCODE_DATA_DIR" ]; then
+    HOST_OPENCODE_DATA_DIR="$OPENCODE_DATA_FALLBACK_DIR"
+  fi
 fi
 
 OPENWORK_PORT="$(pick_port)"
@@ -130,15 +141,27 @@ WEB_PORT="$(pick_port)"
 if [ "$WEB_PORT" = "$OPENWORK_PORT" ]; then
   WEB_PORT="$(pick_port)"
 fi
+SHARE_PORT="${SHARE_PORT:-$(pick_port)}"
+if [ "$SHARE_PORT" = "$OPENWORK_PORT" ] || [ "$SHARE_PORT" = "$WEB_PORT" ]; then
+  SHARE_PORT="$(pick_port)"
+fi
 
 echo "Starting Docker Compose project: $PROJECT" >&2
 echo "- OPENWORK_PORT=$OPENWORK_PORT" >&2
 echo "- WEB_PORT=$WEB_PORT" >&2
+echo "- SHARE_PORT=$SHARE_PORT" >&2
+echo "- OPENWORK_DEV_MODE=1" >&2
+if [ "$MOUNT_HOST_OPENCODE" = "1" ]; then
+  echo "- Host OpenCode import: enabled" >&2
+else
+  echo "- Host OpenCode import: disabled (isolated dev state)" >&2
+fi
 
 start_stack() {
   local config_dir="$1"
   local data_dir="$2"
-  OPENWORK_DEV_ID="$DEV_ID" OPENWORK_PORT="$OPENWORK_PORT" WEB_PORT="$WEB_PORT" \
+  OPENWORK_DEV_ID="$DEV_ID" OPENWORK_PORT="$OPENWORK_PORT" WEB_PORT="$WEB_PORT" SHARE_PORT="$SHARE_PORT" \
+    OPENWORK_DEV_MODE="1" \
     OPENWORK_HOST_OPENCODE_CONFIG_DIR="$config_dir" \
     OPENWORK_HOST_OPENCODE_DATA_DIR="$data_dir" \
     docker compose -p "$PROJECT" -f "$COMPOSE_FILE" up -d
@@ -167,6 +190,7 @@ fi
 echo "" >&2
 echo "OpenWork web UI:     http://localhost:$WEB_PORT" >&2
 echo "OpenWork server:     http://localhost:$OPENWORK_PORT" >&2
+echo "Share service:       http://localhost:$SHARE_PORT" >&2
 echo "Token file:          $ROOT_DIR/tmp/.dev-env-$DEV_ID" >&2
 echo "" >&2
 echo "To stop this stack:" >&2

@@ -20,21 +20,24 @@ use commands::command_files::{
     opencode_command_delete, opencode_command_list, opencode_command_write,
 };
 use commands::config::{read_opencode_config, write_opencode_config};
-use commands::engine::{engine_doctor, engine_info, engine_install, engine_start, engine_stop};
+use commands::engine::{
+    engine_doctor, engine_info, engine_install, engine_restart, engine_start, engine_stop,
+};
 use commands::misc::{
-    app_build_info, obsidian_is_available, open_in_obsidian, opencode_db_migrate, opencode_mcp_auth,
-    reset_opencode_cache, reset_openwork_state,
+    app_build_info, nuke_opencode_dev_config_and_exit, obsidian_is_available, open_in_obsidian,
+    opencode_db_migrate, opencode_mcp_auth, read_obsidian_mirror_file, reset_opencode_cache,
+    reset_openwork_state, write_obsidian_mirror_file,
 };
 use commands::opencode_router::{
     opencodeRouter_config_set, opencodeRouter_info, opencodeRouter_start, opencodeRouter_status,
     opencodeRouter_stop,
 };
-use commands::openwork_server::openwork_server_info;
+use commands::openwork_server::{openwork_server_info, openwork_server_restart};
 use commands::opkg::{import_skill, opkg_install};
 use commands::orchestrator::{
     orchestrator_instance_dispose, orchestrator_start_detached, orchestrator_status,
-    orchestrator_workspace_activate, sandbox_cleanup_openwork_containers, sandbox_doctor,
-    sandbox_stop,
+    orchestrator_workspace_activate, sandbox_cleanup_openwork_containers, sandbox_debug_probe,
+    sandbox_doctor, sandbox_stop,
 };
 use commands::scheduler::{scheduler_delete_job, scheduler_list_jobs};
 use commands::skills::{
@@ -54,6 +57,23 @@ use openwork_server::manager::OpenworkServerManager;
 use orchestrator::manager::OrchestratorManager;
 use tauri::Manager;
 use workspace::watch::WorkspaceWatchState;
+
+#[cfg(target_os = "macos")]
+fn set_dev_app_name() {
+    if std::env::var("OPENWORK_DEV_MODE").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let Some(_mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+
+    objc2_foundation::NSProcessInfo::processInfo()
+        .setProcessName(&objc2_foundation::NSString::from_str("OpenWork - Dev"));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dev_app_name() {}
 
 fn stop_managed_services(app_handle: &tauri::AppHandle) {
     if let Ok(mut engine) = app_handle.state::<EngineManager>().inner.lock() {
@@ -84,6 +104,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build());
 
     let app = builder
+        .setup(|_| {
+            set_dev_app_name();
+            Ok(())
+        })
         .manage(EngineManager::default())
         .manage(OrchestratorManager::default())
         .manage(OpenworkServerManager::default())
@@ -95,14 +119,17 @@ pub fn run() {
             engine_info,
             engine_doctor,
             engine_install,
+            engine_restart,
             orchestrator_status,
             orchestrator_workspace_activate,
             orchestrator_instance_dispose,
             orchestrator_start_detached,
             sandbox_doctor,
+            sandbox_debug_probe,
             sandbox_stop,
             sandbox_cleanup_openwork_containers,
             openwork_server_info,
+            openwork_server_restart,
             opencodeRouter_info,
             opencodeRouter_start,
             opencodeRouter_stop,
@@ -134,8 +161,11 @@ pub fn run() {
             write_opencode_config,
             updater_environment,
             app_build_info,
+            nuke_opencode_dev_config_and_exit,
             obsidian_is_available,
             open_in_obsidian,
+            write_obsidian_mirror_file,
+            read_obsidian_mirror_file,
             reset_openwork_state,
             reset_opencode_cache,
             opencode_db_migrate,

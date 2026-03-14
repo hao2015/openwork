@@ -249,7 +249,15 @@ export function createWorkspaceStore(options: {
   const [sandboxCreatePhase, setSandboxCreatePhase] = createSignal<SandboxCreatePhase>("idle");
 
   const [sandboxCreateProgress, setSandboxCreateProgress] = createSignal<SandboxCreateProgressState | null>(null);
-  const clearSandboxCreateProgress = () => setSandboxCreateProgress(null);
+  const [lastSandboxCreateProgress, setLastSandboxCreateProgress] =
+    createSignal<SandboxCreateProgressState | null>(null);
+  const clearSandboxCreateProgress = () => {
+    const snapshot = sandboxCreateProgress();
+    if (snapshot) {
+      setLastSandboxCreateProgress(snapshot);
+    }
+    setSandboxCreateProgress(null);
+  };
 
   const pushSandboxCreateLog = (line: string) => {
     const value = String(line ?? "").trim();
@@ -1395,15 +1403,53 @@ export function createWorkspaceStore(options: {
     }
   }
 
-  async function createWorkspaceFlow(preset: WorkspacePreset, folder: string | null) {
+  const openEmptySession = async (scopeRoot?: string) => {
+    const root = (scopeRoot ?? activeWorkspaceRoot().trim()).trim();
+
+    if (options.client()) {
+      try {
+        await options.loadSessions(root || undefined);
+      } catch {
+        // If session loading fails, still fall back to the draft-ready session view.
+      }
+    }
+
+    options.setSelectedSessionId(null);
+    options.setMessages([]);
+    options.setTodos([]);
+    options.setPendingPermissions([]);
+    options.setSessionStatusById({});
+    options.setView("session");
+  };
+
+  const activateFreshLocalWorkspace = async (workspaceId: string | null, workspacePath: string) => {
+    if (!workspaceId) {
+      await openEmptySession(workspacePath);
+      return true;
+    }
+
+    const hasClient = Boolean(options.client());
+    const ok = hasClient
+      ? await activateWorkspace(workspaceId)
+      : await startHost({ workspacePath, navigate: false });
+
+    if (!ok) {
+      return false;
+    }
+
+    await openEmptySession(activeWorkspaceRoot().trim() || workspacePath);
+    return true;
+  };
+
+  async function createWorkspaceFlow(preset: WorkspacePreset, folder: string | null): Promise<boolean> {
     if (!isTauriRuntime()) {
       options.setError(t("app.error.tauri_required", currentLocale()));
-      return;
+      return false;
     }
 
     if (!folder) {
       options.setError(t("app.error.choose_folder", currentLocale()));
-      return;
+      return false;
     }
 
     options.setBusy(true);
@@ -1417,7 +1463,7 @@ export function createWorkspaceStore(options: {
       const resolvedFolder = await resolveWorkspacePath(folder);
       if (!resolvedFolder) {
         options.setError(t("app.error.choose_folder", currentLocale()));
-        return;
+        return false;
       }
 
       const name = resolvedFolder.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? "Worker";
@@ -1428,19 +1474,19 @@ export function createWorkspaceStore(options: {
         updateWorkspaceConnectionState(ws.activeId, { status: "connected", message: null });
       }
 
-      const active = ws.workspaces.find((w) => w.id === ws.activeId) ?? null;
-        if (active) {
-          setProjectDir(active.path);
-          setAuthorizedDirs([active.path]);
-        }
-
       setCreateWorkspaceOpen(false);
-      options.setTab("scheduled");
-      options.setView("dashboard");
       markOnboardingComplete();
+
+      const opened = await activateFreshLocalWorkspace(ws.activeId ?? null, resolvedFolder);
+      if (!opened) {
+        return false;
+      }
+
+      return true;
     } catch (e) {
       const message = e instanceof Error ? e.message : safeStringify(e);
       options.setError(addOpencodeCacheHint(message));
+      return false;
     } finally {
       options.setBusy(false);
       options.setBusyLabel(null);
@@ -1473,9 +1519,6 @@ export function createWorkspaceStore(options: {
     const doctor = await refreshSandboxDoctor();
     setSandboxPreflightBusy(false);
     setSandboxCreatePhase("provisioning");
-    options.setBusy(true);
-    options.setBusyLabel("status.creating_workspace");
-    options.setBusyStartedAt(startedAt);
     setSandboxCreateProgress({
       runId,
       startedAt,
@@ -1519,9 +1562,6 @@ export function createWorkspaceStore(options: {
       setSandboxStep("docker", { status: "error", detail });
       setSandboxError(detail);
       setSandboxStage("Docker not ready");
-      options.setBusy(false);
-      options.setBusyLabel(null);
-      options.setBusyStartedAt(null);
       setSandboxCreatePhase("idle");
       return false;
     }
@@ -1585,6 +1625,10 @@ export function createWorkspaceStore(options: {
               const selected = String(payload.payload?.openworkDockerBin ?? "").trim();
               if (selected) {
                 pushSandboxCreateLog(`OPENWORK_DOCKER_BIN=${selected}`);
+              }
+              const resolved = String(payload.payload?.resolvedDockerBin ?? "").trim();
+              if (resolved) {
+                pushSandboxCreateLog(`Resolved docker: ${resolved}`);
               }
               const candidates = Array.isArray(payload.payload?.candidates)
                 ? payload.payload.candidates.filter((item: unknown) => String(item ?? "").trim())
@@ -1660,9 +1704,9 @@ export function createWorkspaceStore(options: {
 
         if (input?.onReady) {
           setSandboxCreatePhase("finalizing");
-          setSandboxStage("Opening session...");
-          setSandboxStep("connect", { status: "active", detail: "Opening session" });
-          pushSandboxCreateLog("Opening session in new worker...");
+          setSandboxStage("Finalizing worker...");
+          setSandboxStep("connect", { status: "active", detail: "Applying setup" });
+          pushSandboxCreateLog("Applying final worker setup...");
           await input.onReady();
         }
 
@@ -1683,9 +1727,6 @@ export function createWorkspaceStore(options: {
     } finally {
       setSandboxPreflightBusy(false);
       setSandboxCreatePhase("idle");
-      options.setBusy(false);
-      options.setBusyLabel(null);
-      options.setBusyStartedAt(null);
     }
   }
 
@@ -1879,6 +1920,8 @@ export function createWorkspaceStore(options: {
       if (activeId) {
         updateWorkspaceConnectionState(activeId, { status: "connected", message: null });
       }
+
+      await openEmptySession(activeWorkspaceRoot().trim() || finalDirectory);
       return true;
     } catch (e) {
       const message = e instanceof Error ? e.message : safeStringify(e);
@@ -2092,6 +2135,7 @@ export function createWorkspaceStore(options: {
   async function recoverWorkspace(workspaceId: string) {
     const id = workspaceId.trim();
     if (!id) return false;
+    if (connectingWorkspaceId() === id) return false;
 
     const workspace = workspaces().find((item) => item.id === id) ?? null;
     if (!workspace) return false;
@@ -2103,42 +2147,40 @@ export function createWorkspaceStore(options: {
       return await testWorkspaceConnection(id);
     };
 
-    updateWorkspaceConnectionState(id, { status: "connecting", message: null });
-
-    if (workspace.workspaceType !== "remote") {
-      return Boolean(await reconnect());
-    }
-
-    const isSandboxWorkspace =
-      workspace.sandboxBackend === "docker" || Boolean(workspace.sandboxContainerName?.trim());
-
-    if (!isSandboxWorkspace) {
-      return Boolean(await reconnect());
-    }
-
-    if (!isTauriRuntime()) {
-      options.setError(t("app.error.tauri_required", currentLocale()));
-      updateWorkspaceConnectionState(id, {
-        status: "error",
-        message: t("app.error.tauri_required", currentLocale()),
-      });
-      return false;
-    }
-
-    const workspacePath = workspace.directory?.trim() || workspace.path?.trim() || "";
-    if (!workspacePath) {
-      const message = "Worker folder is missing. Open Edit connection and try again.";
-      options.setError(message);
-      updateWorkspaceConnectionState(id, { status: "error", message });
-      return false;
-    }
-
-    options.setBusy(true);
-    options.setBusyLabel("Getting worker back online...");
-    options.setBusyStartedAt(Date.now());
+    setConnectingWorkspaceId(id);
     options.setError(null);
 
     try {
+      updateWorkspaceConnectionState(id, { status: "connecting", message: null });
+
+      if (workspace.workspaceType !== "remote") {
+        return Boolean(await reconnect());
+      }
+
+      const isSandboxWorkspace =
+        workspace.sandboxBackend === "docker" || Boolean(workspace.sandboxContainerName?.trim());
+
+      if (!isSandboxWorkspace) {
+        return Boolean(await reconnect());
+      }
+
+      if (!isTauriRuntime()) {
+        options.setError(t("app.error.tauri_required", currentLocale()));
+        updateWorkspaceConnectionState(id, {
+          status: "error",
+          message: t("app.error.tauri_required", currentLocale()),
+        });
+        return false;
+      }
+
+      const workspacePath = workspace.directory?.trim() || workspace.path?.trim() || "";
+      if (!workspacePath) {
+        const message = "Worker folder is missing. Open Edit connection and try again.";
+        options.setError(message);
+        updateWorkspaceConnectionState(id, { status: "error", message });
+        return false;
+      }
+
       const doctor = await refreshSandboxDoctor();
       if (!doctor?.ready) {
         const detail =
@@ -2199,9 +2241,7 @@ export function createWorkspaceStore(options: {
       updateWorkspaceConnectionState(id, { status: "error", message: hint });
       return false;
     } finally {
-      options.setBusy(false);
-      options.setBusyLabel(null);
-      options.setBusyStartedAt(null);
+      setConnectingWorkspaceId((current) => (current === id ? null : current));
     }
   }
 
@@ -2372,12 +2412,11 @@ export function createWorkspaceStore(options: {
       syncActiveWorkspaceId(ws.activeId);
       setCreateWorkspaceOpen(false);
       setCreateRemoteWorkspaceOpen(false);
-      options.setTab("scheduled");
-      options.setView("dashboard");
       markOnboardingComplete();
 
-      if (ws.activeId) {
-        await activateWorkspace(ws.activeId);
+      const opened = await activateFreshLocalWorkspace(ws.activeId ?? null, resolvedFolder);
+      if (!opened) {
+        return;
       }
     } catch (e) {
       const message = e instanceof Error ? e.message : safeStringify(e);
@@ -3192,6 +3231,7 @@ export function createWorkspaceStore(options: {
     setEngineInstallLogs,
     refreshSandboxDoctor,
     sandboxCreateProgress,
+    lastSandboxCreateProgress,
     clearSandboxCreateProgress,
     workspaceDebugEvents,
     clearWorkspaceDebugEvents,
